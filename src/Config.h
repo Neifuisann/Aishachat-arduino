@@ -26,6 +26,7 @@ enum DeviceState
     IDLE,
     LISTENING,
     SPEAKING,
+    TAKING_PHOTO,
     PROCESSING,
     WAITING,
     OTA,
@@ -58,7 +59,7 @@ extern const uint16_t backend_port;
 extern const uint32_t SAMPLE_RATE;
 
 // ---------- Development ------------
-//#define DEV_MODE
+#define DEV_MODE
 
 // ─── HIGH-LEVEL SWITCHES ─────────────────────────────────────────
 #define TTP_GPIO_WAKE            // we have a capacitive key, not a push-button

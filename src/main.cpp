@@ -7,22 +7,27 @@
 #include "Button.h"
 #include "FactoryReset.h"
 
+#include "esp_camera.h"              
+#define CAMERA_MODEL_XIAO_ESP32S3      
+#include "camera_pins.h"     
+#include "ESP32_OV5640_AF.h"    
+
 // #define WEBSOCKETS_DEBUG_LEVEL WEBSOCKETS_LEVEL_ALL  
 
 // ----- Touch-button / Wake pin ---------------------------------
 #define WAKE_PIN         GPIO_NUM_1    // D0 on XIAO
 #define WAKE_ACTIVE_HIGH 1             // TTP-223 default output
-#define LONG_PRESS_MS    500           // keep -> sleep
+#define LONG_PRESS_MS    5000           // keep -> sleep
 #define DEBOUNCE_MS      60
 
-
+OV5640 ov5640;
 AsyncWebServer webServer(80);
 WIFIMANAGER WifiManager;
 esp_err_t getErr = ESP_OK;
 
 void goToSleep() {
     // wait until finger is released, or we’ll bounce straight back
-    while (digitalRead((int)WAKE_PIN) == WAKE_ACTIVE_HIGH) delay(10);
+    while (digitalRead((int)WAKE_PIN) == WAKE_ACTIVE_HIGH) vTaskDelay(10);
   
     // give RTC domain control over the pin
     gpio_pulldown_en(WAKE_PIN);            // keep it LOW while sleeping
@@ -59,14 +64,14 @@ void printOutESP32Error(esp_err_t err)
 static void onButtonLongPressUpEventCb(void *button_handle, void *usr_data)
 {
     Serial.println("Button long press end");
-    delay(10);
+    vTaskDelay(10);
     goToSleep();
 }
 
 static void onButtonDoubleClickCb(void *button_handle, void *usr_data)
 {
     Serial.println("Button double click");
-    delay(10);
+    vTaskDelay(10);
     goToSleep();
 }
 
@@ -79,7 +84,7 @@ void getAuthTokenFromNVS()
 
 void setupWiFi()
 {
-    WifiManager.startBackgroundTask("ELATO-DEVICE");        // Run the background task to take care of our Wifi
+    WifiManager.startBackgroundTask("Aisha Device");        // Run the background task to take care of our Wifi
     WifiManager.fallbackToSoftAp(true);       // Run a SoftAP if no known AP can be reached
     WifiManager.attachWebServer(&webServer);  // Attach our API to the Webserver 
     WifiManager.attachUI();                   // Attach the UI to the Webserver
@@ -94,6 +99,65 @@ void setupWiFi()
     webServer.begin();
 }
 
+
+static bool camera_ok = false;
+
+static void init_camera_once()
+{
+  if (camera_ok) return;
+
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0  = Y2_GPIO_NUM;
+  cfg.pin_d1  = Y3_GPIO_NUM;
+  cfg.pin_d2  = Y4_GPIO_NUM;
+  cfg.pin_d3  = Y5_GPIO_NUM;
+  cfg.pin_d4  = Y6_GPIO_NUM;
+  cfg.pin_d5  = Y7_GPIO_NUM;
+  cfg.pin_d6  = Y8_GPIO_NUM;
+  cfg.pin_d7  = Y9_GPIO_NUM;
+  cfg.pin_xclk = XCLK_GPIO_NUM;
+  cfg.pin_pclk = PCLK_GPIO_NUM;
+  cfg.pin_vsync = VSYNC_GPIO_NUM;
+  cfg.pin_href  = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn  = PWDN_GPIO_NUM;
+  cfg.pin_reset = RESET_GPIO_NUM;
+  cfg.xclk_freq_hz = 8000000;
+  cfg.grab_mode = CAMERA_GRAB_LATEST;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size = FRAMESIZE_XGA;     // 1024×768 = good compromise
+  cfg.jpeg_quality = 24;              // 0–63 (lower = better quality)
+  cfg.fb_location = CAMERA_FB_IN_PSRAM;
+  cfg.fb_count = 2;
+
+  if (esp_camera_init(&cfg) == ESP_OK) {
+    camera_ok = true;
+    Serial.println("Camera initialised");
+  } else {
+    Serial.println("Camera init failed - vision disabled");
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_hmirror(s, 1);
+  s->set_saturation(s, 4);
+
+  ov5640.start(s);
+  if (ov5640.focusInit() == 0) 
+  {
+    Serial.println("OV5640 Focus Init Successful!");
+  }
+
+  if (ov5640.autoFocusMode() == 0) 
+  {
+    Serial.println("OV5640 Auto Focus Successful!");
+  }
+
+  s->set_reg(s, 0x3008, 0xFF, 0x42);   //camera to standby
+  delay(1000);
+}
 
 void IRAM_ATTR touchTask(void*){
     bool pressed=false;
@@ -134,9 +198,10 @@ void setupDeviceMetadata() {
 void setup()
 {
     Serial.begin(115200);
-    delay(500);
+    vTaskDelay(500);
 
     // SETUP
+    init_camera_once();
     setupDeviceMetadata();
     wsMutex = xSemaphoreCreateMutex();    
 

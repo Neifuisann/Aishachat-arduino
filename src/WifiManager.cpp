@@ -96,7 +96,7 @@ void WIFIMANAGER::logMessage(String msg) {
  */
 void wifiTask(void* param) {
   yield();
-  delay(500); // wait a short time until everything is setup before executing the loop forever
+  vTaskDelay(500); // wait a short time until everything is setup before executing the loop forever
   yield();
   const TickType_t xDelay = 10000 / portTICK_PERIOD_MS;
   WIFIMANAGER * wifimanager = (WIFIMANAGER *) param;
@@ -404,7 +404,7 @@ void WIFIMANAGER::loop() {
     }
     logMessage("[WIFI] Running in AP mode but timeout reached. Closing AP!\n");
     stopSoftAP();
-    delay(100);
+    vTaskDelay(100);
   }
 }
 
@@ -474,7 +474,7 @@ bool WIFIMANAGER::tryConnect() {
     auto startTime = millis();
     // wait for connection, fail, or timeout
     while(status != WL_CONNECTED && status != WL_NO_SSID_AVAIL && status != WL_CONNECT_FAILED && (millis() - startTime) <= 10000) {
-        delay(10);
+        vTaskDelay(10);
         status = (wl_status_t)WiFi.waitForConnectResult(5000UL);
     }
     switch(status) {
@@ -625,7 +625,7 @@ void WIFIMANAGER::attachWebServer(WebServer * srv) {
     webServer->send(200, "application/json", "{\"message\":\"Soft AP stopped\"}");
 #endif
     yield();
-    delay(250);
+    vTaskDelay(250);
     runSoftAP();
   });
   
@@ -637,7 +637,7 @@ void WIFIMANAGER::attachWebServer(WebServer * srv) {
     webServer->send(200, "application/json", "{\"message\":\"Soft AP stopped\"}");
 #endif
     yield();
-    delay(250); // It's likely that this message won't go trough, but we give it a short time
+    vTaskDelay(250); // It's likely that this message won't go trough, but we give it a short time
     stopSoftAP();
   });
 
@@ -649,7 +649,7 @@ void WIFIMANAGER::attachWebServer(WebServer * srv) {
     webServer->send(200, "application/json", "{\"message\":\"Terminating current Wifi connection\"}");
 #endif
     yield();
-    delay(500); // It's likely that this message won't go trough, but we give it a short time
+    vTaskDelay(500); // It's likely that this message won't go trough, but we give it a short time
     stopClient();
   });
 
@@ -856,7 +856,7 @@ void WIFIMANAGER::attachUI() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>YOUR ELATO 😊</title>
+    <title>YOUR AISHA 😊</title>
     <style>
         :root {
             --primary-color: #2563eb;
@@ -1038,7 +1038,7 @@ void WIFIMANAGER::attachUI() {
 <body>
     <div class="container">
         <div class="card">
-            <h1>YOUR ELATO DEVICE 😊</h1>
+            <h1>YOUR AISHA DEVICE 😊</h1>
             <div id="status"></div>
             <button onclick="scanNetworks()">Scan for Networks</button>
             <button onclick="showConnectModal()">Manual Connect</button>
