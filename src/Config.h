@@ -12,14 +12,6 @@
 extern Preferences preferences;
 extern bool factory_reset_status;
 
-enum OtaStatus {
-    OTA_IDLE,
-    OTA_IN_PROGRESS,
-    OTA_COMPLETE
-};
-
-extern OtaStatus otaState;
-
 enum DeviceState
 {
     SETUP,
@@ -29,7 +21,7 @@ enum DeviceState
     TAKING_PHOTO,
     PROCESSING,
     WAITING,
-    OTA,
+    QUOTA_EXCEEDED,
     FACTORY_RESET
 };
 
@@ -59,7 +51,7 @@ extern const uint16_t backend_port;
 extern const uint32_t SAMPLE_RATE;
 
 // ---------- Development ------------
-#define DEV_MODE
+// #define DEV_MODE
 
 // ─── HIGH-LEVEL SWITCHES ─────────────────────────────────────────
 #define TTP_GPIO_WAKE            // we have a capacitive key, not a push-button

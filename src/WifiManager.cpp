@@ -6,7 +6,6 @@
  * (Attribution-NonCommercial-ShareAlike 4.0 International)
 **/
 #include "WifiManager.h"
-#include "OTA.h"
 #include "AsyncJson.h"
 #include "ArduinoJson.h"
 #include <WiFi.h>
@@ -66,16 +65,30 @@ bool isDeviceRegistered() {
 
 void connectCb() {
   Serial.println("On connecting to Wifi");
-  if (isDeviceRegistered())  {
-    if (otaState == OTA_IN_PROGRESS) {
-        performOTAUpdate();
-    } else if (otaState == OTA_COMPLETE) {
-        markOTAUpdateComplete();
-        ESP.restart();
+
+  // Ensure device is registered and has a valid auth token before connecting WebSocket
+  Serial.println("=== CHECKING DEVICE REGISTRATION ===");
+
+  if (authTokenGlobal.isEmpty()) {
+    Serial.println("No auth token found, attempting to register device...");
+
+    if (isDeviceRegistered()) {
+      Serial.println("Device registration successful!");
+      Serial.println("New token: " + authTokenGlobal.substring(0, 20) + "...");
     } else {
-        websocketSetup(ws_server, ws_port, ws_path);
+      Serial.println("ERROR: Device registration failed!");
+      Serial.println("Please ensure the device is registered on the server.");
+      Serial.println("MAC Address: " + WiFi.macAddress());
+      Serial.println("WebSocket connection will be attempted anyway...");
     }
-  } 
+  } else {
+    Serial.println("Auth token exists: " + authTokenGlobal.substring(0, 20) + "...");
+  }
+
+  Serial.println("===================================");
+
+  // Start WebSocket connection
+  websocketSetup(ws_server, ws_port, ws_path);
 }
 
 /**

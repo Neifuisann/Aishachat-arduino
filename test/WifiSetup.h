@@ -21,9 +21,6 @@ AsyncWebServer server(80);
 
 int AP_status = 0;
 
-// We'll store our MP3 in SPIFFS at /startup.mp3
-static const char* MP3_FILE = "/startup.mp3";
-
 // Create the AudioTools pipeline components
 AudioSourceSPIFFS source;       // Will read from SPIFFS
 MP3DecoderHelix   decoder;      // MP3 decoder
@@ -114,61 +111,6 @@ String urlEncode(const String &msg)
         }
     }
     return encodedMsg;
-}
-
-// plays when new wifi network connects
-void playStartupSound() {
-      // Check if startup.mp3 actually exists
-  // 2) Mount SPIFFS
-    // Check if startup.mp3 actually exists
-    if(!SPIFFS.begin(true)) {
-        Serial.println("SPIFFS mount failed!");
-        while(true) { delay(10); }
-    }
-
-    File f = SPIFFS.open(MP3_FILE, "r");
-    if(!f){
-        Serial.println("startup.mp3 missing in SPIFFS!");
-        while(true) { delay(10); }
-    } else {
-        Serial.printf("startup.mp3 found, size=%d bytes\n", f.size());
-        f.close();
-    }
-
-    // Configure I2S in TX mode
-    auto cfg = i2s.defaultConfig(TX_MODE);
-    cfg.pin_bck  = 6;
-    cfg.pin_ws   = 5;
-    cfg.pin_data = 7;
-    cfg.channels = 1;
-    cfg.sample_rate = 16000;
-    // cfg.port_no = I2S_PORT_OUT;
-
-    if(!i2s.begin(cfg)) {
-        Serial.println("I2S begin failed!");
-        while(true) { delay(10); }
-    }
-
-    // Initialize the player
-    player.setVolume(1.0f);    
-    if(!player.begin()) {
-        Serial.println("Player begin() failed!");
-        while(true) { delay(10); }
-    }
-
-  // **THIS IS THE MISSING LOOP!**
-    Serial.println("Playing startup sound...");
-    while(true) {
-        size_t copied = player.copy();
-        if (copied == 0) {
-            Serial.println("Playback finished.");
-            delay(500);
-            break;
-        }
-        delay(1);  // Give CPU time for other tasks
-    }
-
-    Serial.println("Startup sound played, set up websocket");
 }
 
 int wifiConnect()

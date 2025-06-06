@@ -3,13 +3,17 @@
  * Includes your working microphone/speaker code AND the photo capture/vision code.
  *******************************************************************************/
 
- #include "OTA.h"
  #include "Print.h"
  #include "Config.h"
  #include "AudioTools.h"
  #include "AudioTools/AudioCodecs/CodecOpus.h"
+ #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
  #include <WebSocketsClient.h>
  #include "Audio.h"
+ #include <math.h>
+ #include "SPIFFS.h"
+ #include <stdlib.h> // Required for rand() and srand()
+ #include <time.h>   // Required for time()
  
  // For camera:
  #include "base64.h"
@@ -18,6 +22,7 @@
  // -------------- WEBSOCKET --------------
  SemaphoreHandle_t wsMutex;
  WebSocketsClient webSocket;
+ SemaphoreHandle_t mp3Mutex; // <<< ADD MUTEX FOR MP3 DECODER ACCESS
  
  // -------------- TASK HANDLES --------------
  TaskHandle_t speakerTaskHandle = NULL;
@@ -28,6 +33,13 @@
  bool scheduleListeningRestart = false;
  unsigned long scheduledTime = 0;
  unsigned long speakingStartTime = 0;
+ unsigned long transitionToSpeakingTimestamp = 0;
+ bool realAudioArrived = false;
+ bool isPlayingProcessingSound = false;
+ bool processingSoundFinished = false;
+ bool isPlayingLimitSound = false;
+ unsigned long lastLimitSoundStartTime = 0; // To prevent instant restart if a file fails/finishes
+ const unsigned long LIMIT_SOUND_RETRY_DELAY = 10000; // ms delay between limit sounds
  
  // -------------- AUDIO SETTINGS --------------
  int currentVolume = 70;
@@ -37,7 +49,11 @@
  // -------------- OUTPUT (TTS) --------------
  BufferRTOS<uint8_t> audioBuffer(AUDIO_BUFFER_SIZE, AUDIO_CHUNK_SIZE);
  OpusAudioDecoder opusDecoder;
+ MP3DecoderHelix mp3Decoder;
+ File processingSoundFile;
  
+ void playSoundFile(const char* filename);
+
  // We'll push TTS data to this "bufferPrint," which then writes into "audioBuffer."
  class BufferPrint : public Print {
  public:
@@ -45,16 +61,22 @@
  
    // Write single byte
    virtual size_t write(uint8_t data) override {
-     if (webSocket.isConnected() && deviceState == SPEAKING) {
-       return _buffer.writeArray(&data, 1);
+     bool isPlayingMp3 = isPlayingProcessingSound || isPlayingLimitSound; // Check if any MP3 is active
+     // Only proceed if SPEAKING and NOT playing an MP3 sound
+     if (webSocket.isConnected() && deviceState == SPEAKING && !isPlayingMp3) {
+         size_t written = _buffer.writeArray(&data, 1);
+         return written;
      }
      return 0;
    }
  
    // Write buffer
    virtual size_t write(const uint8_t *buffer, size_t size) override {
-     if (webSocket.isConnected() && deviceState == SPEAKING) {
-       return _buffer.writeArray(buffer, size);
+     bool isPlayingMp3 = isPlayingProcessingSound || isPlayingLimitSound; // Check if any MP3 is active
+     // Only proceed if SPEAKING and NOT playing an MP3 sound
+     if (webSocket.isConnected() && deviceState == SPEAKING && !isPlayingMp3) {
+         size_t written = _buffer.writeArray(buffer, size);
+         return written;
      }
      return 0;
    }
@@ -120,52 +142,123 @@
  // TRANSITIONS
  // -----------------------------------------------------------------------------
  void transitionToSpeaking() {
-   vTaskDelay(50);
- 
-   // flush mic input so we don't read old data
-   i2sInput.flush();
- 
-   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-     deviceState = SPEAKING;
-     speakingStartTime = millis();
- 
-     webSocket.enableHeartbeat(60000, 30000, 3);
-     xSemaphoreGive(wsMutex);
+   // 1. Signal audioStreamTask to stop playing any current sound
+   bool needsTransition = false;
+   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (deviceState != SPEAKING && deviceState != QUOTA_EXCEEDED) {
+           isPlayingProcessingSound = false;
+           isPlayingLimitSound = false;
+           needsTransition = true;
+           if (processingSoundFile) {
+               processingSoundFile.close();
+           }
+       } else if (deviceState == QUOTA_EXCEEDED) {
+           isPlayingLimitSound = false;
+           needsTransition = true;
+           if (processingSoundFile) {
+               processingSoundFile.close();
+           }
+       }
+       xSemaphoreGive(wsMutex);
    }
- 
-   Serial.println("Transitioned to speaking mode");
+
+   if (!needsTransition) {
+     return; // Already speaking or failed mutex
+   }
+
+   // 3. Now perform the main transition under wsMutex lock
+   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+
+       // *** Reset only the TTS buffer ***
+       audioBuffer.reset();
+       i2s.flush();
+       volume.flush();
+       queue.flush();
+
+       // *** Now change state ***
+       deviceState = SPEAKING;
+       speakingStartTime = millis();
+       transitionToSpeakingTimestamp = millis();
+       realAudioArrived = false;
+       isPlayingProcessingSound = false;
+       isPlayingLimitSound = false;
+       processingSoundFinished = false;
+
+       opusDecoder.setOutput(bufferPrint);
+
+       webSocket.enableHeartbeat(60000, 30000, 3);
+       xSemaphoreGive(wsMutex);
+
+   } else {
+       Serial.println("TransitionToSpeaking: Failed to get ws mutex!");
+   }
  }
  
  void transitionToListening() {
-   deviceState = PROCESSING;
-   scheduleListeningRestart = false;
-   Serial.println("Transitioning to listening mode");
+   bool wasPlayingMp3 = false;
+   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+       if (deviceState == QUOTA_EXCEEDED || isPlayingProcessingSound || isPlayingLimitSound) {
+           wasPlayingMp3 = true;
+           Serial.println("Stopping MP3 sound due to transitionToListening.");
+           isPlayingLimitSound = false;
+           isPlayingProcessingSound = false;
+           if (processingSoundFile) {
+               processingSoundFile.close();
+           }
+       }
+       realAudioArrived = false; // Reset this too
+       processingSoundFinished = false;
+       xSemaphoreGive(wsMutex);
+   }
  
-   // flush streams
-   i2s.flush();
-   volume.flush();
-   queue.flush();
-   i2sInput.flush();
-   audioBuffer.reset();
+   // Give audio task time to stop if it was playing MP3
+   if (wasPlayingMp3) {
+       vTaskDelay(pdMS_TO_TICKS(10));
+   }
  
-   Serial.println("Transitioned to listening mode");
  
    if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-     deviceState = LISTENING;
-     webSocket.disableHeartbeat();
-     xSemaphoreGive(wsMutex);
+      deviceState = PROCESSING; // Intermediate state before LISTENING
+      scheduleListeningRestart = false;
+      Serial.println("Transitioning to listening mode");
+ 
+      // Flush streams and reset TTS buffer
+      i2s.flush();
+      volume.flush();
+      queue.flush();
+      i2sInput.flush(); // Mic input
+      audioBuffer.reset();
+ 
+      webSocket.disableHeartbeat();
+      xSemaphoreGive(wsMutex);
+ 
+      // Set final state after releasing mutex
+      deviceState = LISTENING;
+      Serial.println("Transitioned to listening mode");
+ 
+   } else {
+      Serial.println("TransitionToListening: Failed to get wsMutex");
+      // Attempt to force state anyway? Or just log error? For now, log.
+      // Maybe set state directly if mutex fails? Risky.
+      deviceState = LISTENING; // Force state change if mutex fails?
    }
  }
-
+ 
  void transitionToTakingPhoto() {
-  deviceState = TAKING_PHOTO;
+   // Set state early? Or after sound? Let's set early.
+   deviceState = TAKING_PHOTO;
+   Serial.println("Transitioning to take photo...");
 
-  captureAndSendPhotoBase64();
+   // Play camera shutter sound synchronously
+   playSoundFile("/camera.mp3"); // <<< PLAY CAMERA SOUND
 
-  Serial.println("Photo capture done");
+   // Now capture the photo
+   captureAndSendPhotoBase64();
+   Serial.println("Photo capture done");
 
-  transitionToSpeaking();
-}
+   // Immediately transition to speaking (server expects image data then TTS)
+   transitionToSpeaking();
+ }
  
  /*******************************************************************************
   * CAMERA / VISION
@@ -174,20 +267,20 @@
  void captureAndSendPhotoBase64() {
    sensor_t* sensor = esp_camera_sensor_get();  
    sensor->set_reg(sensor, 0x3008, 0xFF, 0x02); // from standby to ready
-
+ 
    delay(1000);
-
+ 
    camera_fb_t *fb = nullptr;
    
    fb = esp_camera_fb_get();
-
+ 
    // base64-encode
    size_t encodedLen = base64_enc_len(fb->len);
    char *b64buf = (char*)malloc(encodedLen + 1);
-
+ 
    base64_encode(b64buf, (char*)fb->buf, fb->len);
    esp_camera_fb_return(fb);
-
+ 
    StaticJsonDocument<256> doc;
    doc["type"] = "image";
    doc["mime"] = "image/jpeg";
@@ -196,7 +289,7 @@
    String json;
    serializeJson(doc, json);
    free(b64buf);
-
+ 
    // Send to server
    if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
      webSocket.sendTXT(json);
@@ -213,48 +306,203 @@
  // -----------------------------------------------------------------------------
  void audioStreamTask(void *parameter) {
    Serial.println("Starting speaker pipeline...");
+   srand(time(NULL));
  
-   // Setup Opus decoder for TTS
+   // Opus Setup (Output initially to bufferPrint)
    OpusSettings cfg;
-   cfg.sample_rate = 24000; 
+   cfg.sample_rate = 24000;
    cfg.channels = CHANNELS;
    cfg.bits_per_sample = BITS_PER_SAMPLE;
-   cfg.max_buffer_size = 6144;
-   opusDecoder.setOutput(bufferPrint);
+   cfg.max_buffer_size = 6144; // Adjust if needed
+   opusDecoder.setOutput(bufferPrint); // Default output
    opusDecoder.begin(cfg);
  
-   queue.begin();
+   // MP3 Setup (Output initially NULL, will be set dynamically)
+   mp3Decoder.begin();
+   uint8_t mp3ReadBuffer[1024];
+   char randomSoundPath[30];
  
-   // I2S config for speaker
+   // Output Pipeline Setup (i2s, volume, queue, copier)
+   queue.begin();
    auto i2sCfg = i2s.defaultConfig(TX_MODE);
    i2sCfg.bits_per_sample = BITS_PER_SAMPLE;
    i2sCfg.sample_rate = 24000;
    i2sCfg.channels = CHANNELS;
-   i2sCfg.pin_bck  = I2S_BCK_OUT;
-   i2sCfg.pin_ws   = I2S_WS_OUT;
+   i2sCfg.pin_bck = I2S_BCK_OUT;
+   i2sCfg.pin_ws = I2S_WS_OUT;
    i2sCfg.pin_data = I2S_DATA_OUT;
-   i2sCfg.port_no  = I2S_PORT_OUT;
+   i2sCfg.port_no = I2S_PORT_OUT;
    i2sCfg.copyFrom(info);
    i2s.begin(i2sCfg);
  
    auto vcfg = volume.defaultConfig();
    vcfg.copyFrom(i2sCfg);
-   vcfg.allow_boost = true;
+   vcfg.allow_boost = true; // Or false if not needed
    volume.begin(vcfg);
+   volume.setVolume(currentVolume / 100.0f); // Set initial volume
  
+ 
+   // Main Loop
    while (1) {
-     if (webSocket.isConnected() && deviceState == SPEAKING) {
-       // Copy TTS from queue -> speaker
-       copier.copy();
+     bool playingMp3ThisIteration = false; // Track if we decoded MP3 in this loop pass
+ 
+     // --- Acquire MP3 Mutex if planning to use MP3 Decoder ---
+     bool mightPlayMp3 = (deviceState == SPEAKING && !isPlayingProcessingSound && !realAudioArrived && !processingSoundFinished && transitionToSpeakingTimestamp > 0) ||
+                        (deviceState == SPEAKING && isPlayingProcessingSound) ||
+                        (deviceState == QUOTA_EXCEEDED && !isPlayingLimitSound) ||
+                        (deviceState == QUOTA_EXCEEDED && isPlayingLimitSound);
+
+     bool mp3MutexTaken = false;
+     if (mightPlayMp3) {
+         // Try to take mutex with a short timeout. If fails, skip MP3 logic this iteration.
+         if (xSemaphoreTake(mp3Mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+              mp3MutexTaken = true;
+         } else {
+              // Serial.println("Audio Task: Failed to get mp3Mutex quickly, skipping MP3 check.");
+         }
      }
-     vTaskDelay(1);
-   }
+
+     // --- Handle SPEAKING State (only if mutex acquired) ---
+     if (deviceState == SPEAKING && mp3MutexTaken) {
+         // 1. Check if we should START playing processing sound
+         if (!isPlayingProcessingSound && !realAudioArrived && !processingSoundFinished &&
+             transitionToSpeakingTimestamp > 0 &&
+             (millis() - transitionToSpeakingTimestamp > 1000)) { // Removed buffer check
+ 
+             int randomSoundIndex = rand() % 10 + 1;
+             snprintf(randomSoundPath, sizeof(randomSoundPath), "/processing_%d.mp3", randomSoundIndex);
+             Serial.printf("Attempting to start processing sound: %s...\n", randomSoundPath);
+ 
+             if (processingSoundFile) processingSoundFile.close(); // Close previous just in case
+             processingSoundFile = SPIFFS.open(randomSoundPath, "r");
+ 
+             if (!processingSoundFile || processingSoundFile.isDirectory()) {
+                 Serial.printf("Failed to open %s\n", randomSoundPath);
+                 processingSoundFinished = true; // Don't try again this cycle
+             } else {
+                 Serial.printf("Opened %s, starting MP3->Volume pipe.\n", randomSoundPath);
+                 isPlayingProcessingSound = true;
+                 mp3Decoder.setOutput(volume); // <<< Direct MP3 decoded output to volume stream
+                 mp3Decoder.begin(); // Reset decoder state for new file
+             }
+         }
+ 
+         // 2. Check if we should STOP playing processing sound (due to real audio)
+         if (isPlayingProcessingSound && realAudioArrived) {
+             Serial.println("Stopping processing sound MP3 (real audio detected)...");
+             isPlayingProcessingSound = false;
+             if (processingSoundFile) processingSoundFile.close();
+             opusDecoder.setOutput(bufferPrint);
+         }
+ 
+         // 3. Decode and DIRECTLY OUTPUT processing sound chunk if active
+         if (isPlayingProcessingSound && processingSoundFile) {
+             // Mutex is already held here
+             size_t bytesRead = processingSoundFile.read(mp3ReadBuffer, sizeof(mp3ReadBuffer));
+              if (bytesRead > 0) {
+                  size_t written = mp3Decoder.write(mp3ReadBuffer, bytesRead);
+                  // Optional: Check 'written' if needed
+                  // if (written != bytesRead) { Serial.printf("Warn: Processing MP3 direct write %d/%d\n", written, bytesRead); }
+                  playingMp3ThisIteration = true; // We decoded MP3 data
+              } else {
+                  // End of file
+                  Serial.println("Processing sound MP3 finished.");
+                  isPlayingProcessingSound = false;
+                  processingSoundFinished = true; // Mark finished for this SPEAKING cycle
+                  if (processingSoundFile) processingSoundFile.close();
+                  mp3Decoder.begin(); // Reset decoder state
+                  // No need to change output, it's already volume
+              }
+         }
+     } // --- End of SPEAKING State Logic ---
+ 
+     // --- Handle QUOTA_EXCEEDED State (only if mutex acquired) ---
+     else if (deviceState == QUOTA_EXCEEDED && mp3MutexTaken) {
+         // 1. Check if we should START playing a limit sound
+         if (!isPlayingLimitSound && (millis() - lastLimitSoundStartTime > LIMIT_SOUND_RETRY_DELAY)) {
+             int randomSoundIndex = rand() % 2 + 1;
+             snprintf(randomSoundPath, sizeof(randomSoundPath), "/limit_%d.mp3", randomSoundIndex);
+             Serial.printf("Attempting to play limit sound: %s...\n", randomSoundPath);
+ 
+             if (processingSoundFile) processingSoundFile.close(); // Close previous
+             processingSoundFile = SPIFFS.open(randomSoundPath, "r");
+ 
+             if (!processingSoundFile || processingSoundFile.isDirectory()) {
+                 Serial.printf("Failed to open %s\n", randomSoundPath);
+                 isPlayingLimitSound = false; // Ensure flag is false
+                 lastLimitSoundStartTime = millis(); // Record time to enforce delay before next try
+             } else {
+                 Serial.printf("Opened %s, starting MP3->Volume pipe.\n", randomSoundPath);
+                 isPlayingLimitSound = true;
+                 mp3Decoder.setOutput(volume); // <<< Direct MP3 to volume
+                 mp3Decoder.begin(); // Reset decoder
+                 lastLimitSoundStartTime = millis(); // Reset time for next potential retry after this one finishes
+             }
+         }
+ 
+         // 2. Decode and DIRECTLY OUTPUT limit sound chunk if active
+         if (isPlayingLimitSound && processingSoundFile) {
+             // Mutex is already held here
+             size_t bytesRead = processingSoundFile.read(mp3ReadBuffer, sizeof(mp3ReadBuffer));
+             if (bytesRead > 0) {
+                 size_t written = mp3Decoder.write(mp3ReadBuffer, bytesRead);
+                 // if (written != bytesRead) { Serial.printf("Warn: Limit MP3 direct write %d/%d\n", written, bytesRead); }
+                 playingMp3ThisIteration = true; // We decoded MP3 data
+             } else {
+                 // End of file
+                 Serial.println("Limit sound MP3 finished.");
+                 if (processingSoundFile) processingSoundFile.close();
+                 isPlayingLimitSound = false; // Ready to play next one after delay
+                 lastLimitSoundStartTime = millis(); // Record finish time for delay calculation
+                 mp3Decoder.begin(); // Reset decoder state
+                 // No need to change output, it's already volume
+             }
+         }
+     } // --- End of QUOTA_EXCEEDED State Logic ---
+
+
+     // --- Release MP3 Mutex if taken ---
+     if (mp3MutexTaken) {
+         // Reset decoder if no MP3 is active anymore
+         if (!isPlayingProcessingSound && !isPlayingLimitSound) { 
+              mp3Decoder.begin();
+         }
+         xSemaphoreGive(mp3Mutex);
+     }
+
+     // --- Handle non-MP3 states or TTS part of SPEAKING ---
+     if (!playingMp3ThisIteration) {
+         // Ensure Opus decoder is connected to bufferPrint
+          opusDecoder.setOutput(bufferPrint);
+ 
+         // Copy data from the Opus/TTS buffer to the output
+         // This handles the actual TTS playback
+         copier.copy();
+ 
+         // Adjust delays based on state
+         if (deviceState != SPEAKING && deviceState != QUOTA_EXCEEDED) { 
+              vTaskDelay(pdMS_TO_TICKS(10)); // Idle delay
+              // Clean up just in case state changed abruptly
+              if (isPlayingProcessingSound || isPlayingLimitSound) { 
+                 isPlayingProcessingSound = false;
+                 isPlayingLimitSound = false;
+                 if (processingSoundFile) processingSoundFile.close();
+              }
+         } else {
+              // Shorter delay during active playback (TTS, MP3)
+              vTaskDelay(pdMS_TO_TICKS(1));
+         }
+     } else {
+          // If we *did* play MP3 this iteration, just add a short delay
+          vTaskDelay(pdMS_TO_TICKS(1));
+     }
+ 
+   } // End while(1)
  }
  
  void micTask(void *parameter) {
    Serial.println("Starting microphone pipeline...");
  
-   // Configure I2S input for PDM mic
    auto i2sConfig = i2sInput.defaultConfig(RX_MODE);
    i2sConfig.bits_per_sample = BITS_PER_SAMPLE;
    i2sConfig.sample_rate = 16000; 
@@ -263,7 +511,7 @@
    i2sConfig.signal_type = PDM;
    i2sConfig.pin_data = PDM_DATA;
    i2sConfig.pin_ws   = PDM_CLK;
-   i2sConfig.pin_bck  = I2S_PIN_NO_CHANGE; // Not used for PDM
+   i2sConfig.pin_bck  = I2S_PIN_NO_CHANGE;
    i2sConfig.port_no  = I2S_PORT_IN;
    i2sInput.begin(i2sConfig);
  
@@ -273,7 +521,6 @@
      }
  
      if (deviceState == LISTENING && webSocket.isConnected()) {
-       // read mic -> forward to WS
        micToWsCopier.copyBytes(MIC_COPY_SIZE);
        vTaskDelay(1);
      } else {
@@ -309,29 +556,14 @@
  
        String typeS = doc["type"];
        if (typeS == "auth") {
-         // e.g. currentVolume, OTA, reset, etc.
          currentVolume = doc["volume_control"] | 70;
          volume.setVolume(currentVolume / 100.0f);
- 
-         bool is_ota = doc["is_ota"] | false;
-         bool is_reset = doc["is_reset"] | false;
-         if (is_ota) {
-           Serial.println("OTA update requested => handle");
-           setOTAStatusInNVS(OTA_IN_PROGRESS);
-           ESP.restart();
-         }
-         if (is_reset) {
-           Serial.println("Factory reset requested => handle");
-           // ...
-           ESP.restart();
-         }
        }
        else if (typeS == "server") {
          String msg = doc["msg"] | "";
          Serial.println(msg);
  
          if (msg == "RESPONSE.COMPLETE" || msg == "RESPONSE.ERROR") {
-           // wrap up => go listening
            Serial.println("Server => done speaking => Listening");
            if (doc.containsKey("volume_control")) {
              int newVol = doc["volume_control"] | 70;
@@ -351,15 +583,36 @@
            Serial.println("Server => capture photo => transitionToTakingPhoto");
            transitionToTakingPhoto();
          }
+         else if (msg == "QUOTA.EXCEEDED") {
+           Serial.println("Server => quota exceeded => Playing limit sounds");
+           if (deviceState != QUOTA_EXCEEDED) {
+              deviceState = QUOTA_EXCEEDED;
+              isPlayingProcessingSound = false;
+              processingSoundFinished = false;
+              realAudioArrived = false;
+              if (processingSoundFile) {
+                  processingSoundFile.close();
+              }
+              audioBuffer.reset();
+              i2s.flush();
+              volume.flush();
+              queue.flush();
+              isPlayingLimitSound = false;
+              lastLimitSoundStartTime = 0;
+           }
+         }
        }
      }
      break;
  
      case WStype_BIN:
-       // TTS opus data from server
        if (scheduleListeningRestart || deviceState != SPEAKING) {
          Serial.println("Ignoring inbound TTS because not in SPEAKING mode");
          break;
+       }
+       if (!realAudioArrived) {
+           Serial.println("First real audio packet arrived.");
+           realAudioArrived = true;
        }
        {
          size_t processed = opusDecoder.write(payload, length);
@@ -382,12 +635,24 @@
  // WEBSOCKET SETUP + NETWORK TASK
  // -----------------------------------------------------------------------------
  void websocketSetup(String server_domain, int port, String path) {
+   // wsMutex = xSemaphoreCreateMutex(); // <<< REMOVED Initialization
+   // mp3Mutex = xSemaphoreCreateMutex(); // <<< REMOVED Initialization
+
+   Serial.println("=== WEBSOCKET SETUP ===");
+   Serial.println("Server: " + server_domain + ":" + String(port) + path);
+
+   if (authTokenGlobal.isEmpty()) {
+     Serial.println("WARNING: Auth token is empty! WebSocket connection will likely fail.");
+     Serial.println("Authorization header: Bearer [EMPTY]");
+   } else {
+     Serial.println("Auth token: " + authTokenGlobal.substring(0, 20) + "...");
+   }
+
    String headers = "Authorization: Bearer " + String(authTokenGlobal);
    webSocket.setExtraHeaders(headers.c_str());
    webSocket.onEvent(webSocketEvent);
    webSocket.setReconnectInterval(1000);
  
-   // Heartbeat pings
    webSocket.enableHeartbeat(60000, 30000, 3);
  
  #ifdef DEV_MODE
@@ -395,6 +660,9 @@
  #else
    webSocket.beginSslWithCA(server_domain.c_str(), port, path.c_str(), CA_cert);
  #endif
+
+   Serial.println("WebSocket connection initiated");
+   Serial.println("======================");
  }
  
  void networkTask(void *parameter) {
@@ -403,3 +671,50 @@
      vTaskDelay(1);
    }
  }
+ 
+ // -----------------------------------------------------------------------------
+ // SYNCHRONOUS SOUND PLAYBACK UTILITY
+ // -----------------------------------------------------------------------------
+ void playSoundFile(const char* filename) {
+     Serial.printf("Attempting to play sound file: %s\n", filename);
+
+     // 1. Acquire MP3 Decoder Mutex (wait indefinitely)
+     if (xSemaphoreTake(mp3Mutex, portMAX_DELAY) != pdTRUE) {
+         Serial.printf("Failed to acquire mp3Mutex for %s\n", filename);
+         return;
+     }
+
+     // 2. Open File
+     File soundFile = SPIFFS.open(filename, "r");
+     if (!soundFile || soundFile.isDirectory()) {
+         Serial.printf("Failed to open sound file: %s\n", filename);
+         xSemaphoreGive(mp3Mutex); // Release mutex before returning
+         return;
+     }
+     Serial.printf("Opened %s, size: %d\n", filename, soundFile.size());
+
+     // 3. Prepare Decoder and Output
+     mp3Decoder.setOutput(volume); // Target the volume stream directly
+     mp3Decoder.begin();           // Reset decoder state
+
+     // 4. Playback Loop
+     uint8_t buffer[1024];
+     size_t bytesRead;
+     while ((bytesRead = soundFile.read(buffer, sizeof(buffer))) > 0) {
+         size_t written = mp3Decoder.write(buffer, bytesRead);
+         // Optional: Check 'written' if needed, but usually okay for direct synchronous playback
+         vTaskDelay(pdMS_TO_TICKS(1)); // Small delay to prevent starving other tasks
+     }
+
+     // 5. Cleanup
+     soundFile.close();
+     // mp3Decoder.setOutput(nullptr); // Not needed/valid - Task loop will reset if necessary
+     Serial.printf("Finished playing %s\n", filename);
+
+     // Call begin again AFTER playback to ensure decoder is fully reset for next use
+     mp3Decoder.begin();
+
+     // 6. Release Mutex
+     xSemaphoreGive(mp3Mutex);
+ }
+ 

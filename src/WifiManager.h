@@ -30,6 +30,9 @@ void wifiTask(void* param);
 // Callback for when the device connects to Wifi
 void connectCb();
 
+// Check if device is registered and get auth token
+bool isDeviceRegistered();
+
 
 class WIFIMANAGER {
   protected:

@@ -1,46 +1,21 @@
-#include "OTA.h"
 #include <Arduino.h>
 #include <driver/rtc_io.h>
 #include "Config.h"
 #include "SPIFFS.h"
 #include "WifiManager.h"
-#include "Button.h"
 #include "FactoryReset.h"
+#include "Audio.h"
 
 #include "esp_camera.h"              
 #define CAMERA_MODEL_XIAO_ESP32S3      
-#include "camera_pins.h"     
-#include "ESP32_OV5640_AF.h"    
+#include "camera_pins.h"      
 
 // #define WEBSOCKETS_DEBUG_LEVEL WEBSOCKETS_LEVEL_ALL  
 
-// ----- Touch-button / Wake pin ---------------------------------
-#define WAKE_PIN         GPIO_NUM_1    // D0 on XIAO
-#define WAKE_ACTIVE_HIGH 1             // TTP-223 default output
-#define LONG_PRESS_MS    5000           // keep -> sleep
-#define DEBOUNCE_MS      60
-
-OV5640 ov5640;
 AsyncWebServer webServer(80);
 WIFIMANAGER WifiManager;
 esp_err_t getErr = ESP_OK;
 
-void goToSleep() {
-    // wait until finger is released, or we’ll bounce straight back
-    while (digitalRead((int)WAKE_PIN) == WAKE_ACTIVE_HIGH) vTaskDelay(10);
-  
-    // give RTC domain control over the pin
-    gpio_pulldown_en(WAKE_PIN);            // keep it LOW while sleeping
-    esp_sleep_enable_ext0_wakeup(WAKE_PIN, WAKE_ACTIVE_HIGH);  // EXT0
-  
-    Serial.println("Deep-sleep now…");
-
-    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_AUTO); 
-    delayMicroseconds(200);// wait for the pull-down to take effect
-
-    esp_deep_sleep_start();
-  }
-  
 
 void printOutESP32Error(esp_err_t err)
 {
@@ -61,25 +36,19 @@ void printOutESP32Error(esp_err_t err)
     }
 }
 
-static void onButtonLongPressUpEventCb(void *button_handle, void *usr_data)
-{
-    Serial.println("Button long press end");
-    vTaskDelay(10);
-    goToSleep();
-}
-
-static void onButtonDoubleClickCb(void *button_handle, void *usr_data)
-{
-    Serial.println("Button double click");
-    vTaskDelay(10);
-    goToSleep();
-}
-
 void getAuthTokenFromNVS()
 {
     preferences.begin("auth", false);
     authTokenGlobal = preferences.getString("auth_token", "");
     preferences.end();
+
+    Serial.println("=== AUTH TOKEN STATUS ===");
+    if (authTokenGlobal.isEmpty()) {
+        Serial.println("No auth token found in NVS storage");
+    } else {
+        Serial.println("Auth token loaded from NVS: " + authTokenGlobal.substring(0, 20) + "...");
+    }
+    Serial.println("========================");
 }
 
 void setupWiFi()
@@ -125,10 +94,10 @@ static void init_camera_once()
   cfg.pin_sscb_scl = SIOC_GPIO_NUM;
   cfg.pin_pwdn  = PWDN_GPIO_NUM;
   cfg.pin_reset = RESET_GPIO_NUM;
-  cfg.xclk_freq_hz = 8000000;
+  cfg.xclk_freq_hz = 10000000;
   cfg.grab_mode = CAMERA_GRAB_LATEST;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size = FRAMESIZE_XGA;     // 1024×768 = good compromise
+  cfg.frame_size = FRAMESIZE_XGA;     // 1024×768 = good compromise 
   cfg.jpeg_quality = 24;              // 0–63 (lower = better quality)
   cfg.fb_location = CAMERA_FB_IN_PSRAM;
   cfg.fb_count = 2;
@@ -144,56 +113,23 @@ static void init_camera_once()
   s->set_hmirror(s, 1);
   s->set_saturation(s, 4);
 
-  ov5640.start(s);
-  if (ov5640.focusInit() == 0) 
-  {
-    Serial.println("OV5640 Focus Init Successful!");
-  }
-
-  if (ov5640.autoFocusMode() == 0) 
-  {
-    Serial.println("OV5640 Auto Focus Successful!");
-  }
-
   s->set_reg(s, 0x3008, 0xFF, 0x42);   //camera to standby
   delay(1000);
 }
 
-void IRAM_ATTR touchTask(void*){
-    bool pressed=false;
-    unsigned long t0=0;
-  
-    while (true){
-      bool now = digitalRead((int)WAKE_PIN)==WAKE_ACTIVE_HIGH;
-      unsigned long ms = millis();
-  
-      if (now && !pressed) {           // touch-down
-        pressed=true;  t0=ms;
-      }
-      if (!now && pressed) {           // release
-        pressed=false;
-        if (ms-t0 > LONG_PRESS_MS) goToSleep();   // long press => sleep
-      }
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-  
-
-
 void setupDeviceMetadata() {
-    // factoryResetDevice();
-    deviceState = IDLE;
+    // Initialize mutexes early, before tasks start
+    wsMutex = xSemaphoreCreateMutex();
+    mp3Mutex = xSemaphoreCreateMutex(); // <<< Initialize MP3 Mutex here
+
+    // factoryResetDevice(); // Call this if needed before state checks
 
     getAuthTokenFromNVS();
-    getOTAStatusFromNVS();
 
-    if (otaState == OTA_IN_PROGRESS || otaState == OTA_COMPLETE) {
-        deviceState = OTA;
-    }
-    if (factory_reset_status) {
-        deviceState = FACTORY_RESET;
-    }
+    Serial.printf("Initial Device State: %d\n", deviceState); // Add log
 }
+
+
 
 void setup()
 {
@@ -201,30 +137,15 @@ void setup()
     vTaskDelay(500);
 
     // SETUP
-    init_camera_once();
     setupDeviceMetadata();
-    wsMutex = xSemaphoreCreateMutex();    
 
-    pinMode((int)WAKE_PIN, INPUT_PULLDOWN);        // idle LOW
-    rtc_gpio_pulldown_en(WAKE_PIN);
-    
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) 
-    {
-        Serial.println("Woke up via TTP-223 touch");
-    }    
-
-    // INTERRUPT
-    #ifdef TTP_GPIO_WAKE
-        xTaskCreatePinnedToCore(touchTask,"touch",2048,nullptr,2,nullptr,1);
-
-    #else
-        getErr = esp_sleep_enable_ext0_wakeup(BUTTON_PIN, LOW);
-        printOutESP32Error(getErr);
-        Button *btn = new Button(BUTTON_PIN, false);
-        btn->attachLongPressUpEventCb(&onButtonLongPressUpEventCb, NULL);
-        btn->attachDoubleClickEventCb(&onButtonDoubleClickCb, NULL);
-        btn->detachSingleClickEvent();
-    #endif
+    // Mount SPIFFS *before* creating tasks that might use it
+    if(!SPIFFS.begin(true)) { // Use format SPIFFS if not mounted
+        Serial.println("SPIFFS Mount Failed! Halting.");
+        while(true) { delay(10); } // Stop execution if SPIFFS fails
+    } else {
+        Serial.println("SPIFFS Mounted.");
+    }
 
     xTaskCreatePinnedToCore(
         audioStreamTask,   // Function
@@ -256,14 +177,15 @@ void setup()
         &networkTaskHandle,// Handle
         0                  // Core 0 (protocol core)
     );
+    
+
 
     // WIFI
     setupWiFi();
+
+    // Camera (can run after tasks are created)
+    init_camera_once();
 }
 
 void loop(){
-    if (otaState == OTA_IN_PROGRESS)
-    {
-        loopOTA();
-    }
 }

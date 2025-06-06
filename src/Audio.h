@@ -6,6 +6,9 @@
 #ifndef AUDIO_H
 #define AUDIO_H
 
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "Print.h"
 #include "Config.h"
 #include "AudioTools.h"
@@ -14,6 +17,7 @@
 
 // -------------- External Declarations --------------
 extern SemaphoreHandle_t wsMutex;
+extern SemaphoreHandle_t mp3Mutex;
 extern WebSocketsClient webSocket;
 
 extern TaskHandle_t speakerTaskHandle;
