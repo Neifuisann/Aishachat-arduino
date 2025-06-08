@@ -198,7 +198,7 @@ void setup()
     xTaskCreatePinnedToCore(
         micTask,           // Function
         "Microphone Task", // Name
-        4096,             // Stack size 
+        16384,             // Stack size 
         NULL,              // Parameters
         4,                 // Priority
         NULL,              // Handle

@@ -11,13 +11,14 @@
  #include <WebSocketsClient.h>
  #include <ArduinoJson.h>
  #include "Audio.h"
+ #include "ADPCM.h"  // Add ADPCM support
  #include "PitchShift.h"
  #include "VADConfig.h"
  #include <math.h>
  #include "SPIFFS.h"
  #include <stdlib.h> // Required for rand() and srand()
  #include <time.h>   // Required for time()
- 
+
  // For camera:
  #include "base64.h"
  #include "esp_camera.h"
@@ -105,9 +106,9 @@ StreamCopy pitchCopier(volumePitch, queue);
  // Audio info for speaker - Use 24kHz to match Gemini TTS output
  AudioInfo info(24000, CHANNELS, BITS_PER_SAMPLE);
  
- // -------------- MICROPHONE INPUT --------------
- // We define the same approach you had:
- class WebsocketStream : public Print {
+ // -------------- MICROPHONE INPUT WITH ADPCM --------------
+ // ADPCM-compressed WebSocket stream
+ class ADPCMWebsocketStream : public Print {
  public:
    virtual size_t write(uint8_t b) override {
      if (!webSocket.isConnected() || deviceState != LISTENING) {
@@ -119,7 +120,7 @@ StreamCopy pitchCopier(volumePitch, queue);
      }
      return 1;
    }
- 
+
    virtual size_t write(const uint8_t *buffer, size_t size) override {
      if (!webSocket.isConnected() || deviceState != LISTENING) {
        return size;
@@ -131,11 +132,22 @@ StreamCopy pitchCopier(volumePitch, queue);
      return size;
    }
  };
- 
- static WebsocketStream rawWsStream;  // For raw PCM transmission
+
+ static ADPCMWebsocketStream adpcmWsStream;  // For ADPCM compressed transmission
+ ADPCMEncoderStream adpcmEncoder(&adpcmWsStream, 1024); // ADPCM encoder with 1KB buffer (extern in header)
+
+ // Memory monitoring for ADPCM
+ void checkADPCMMemory() {
+   static unsigned long lastMemCheck = 0;
+   if (millis() - lastMemCheck > 30000) { // Check every 30 seconds
+     Serial.printf("ADPCM Memory: Free heap: %d bytes, Largest block: %d bytes\n",
+                   ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+     lastMemCheck = millis();
+   }
+ }
  I2SStream i2sInput;  // Remove static since it's declared extern in header
- static const int MIC_COPY_SIZE = 64; // chunk size for mic -> WS
- StreamCopy micToWsCopier(rawWsStream, i2sInput); // Direct mic -> WebSocket streaming
+ static const int MIC_COPY_SIZE = 64; // chunk size for mic -> ADPCM encoder
+ StreamCopy micToAdpcmCopier(adpcmEncoder, i2sInput); // mic -> ADPCM encoder -> WebSocket
 
  // VAD (Voice Activity Detection) components
  VoiceActivityDetector vad;
@@ -149,6 +161,20 @@ StreamCopy pitchCopier(volumePitch, queue);
  static bool vadShouldStream = false;
  static bool vadPrefixSent = false;
 
+ void sendPCMFrameADPCM(const int16_t* frame, size_t frameSize) {
+   if (!webSocket.isConnected() || deviceState != LISTENING) {
+     return;
+   }
+
+   // Send PCM data through ADPCM encoder
+   size_t pcmDataSize = frameSize * sizeof(int16_t);
+   const uint8_t* pcmBytes = (const uint8_t*)frame;
+
+   // Send to ADPCM encoder which will compress and forward to WebSocket
+   adpcmEncoder.write(pcmBytes, pcmDataSize);
+ }
+
+ // Keep the original function for compatibility/debugging
  void sendPCMFrameRaw(const int16_t* frame, size_t frameSize) {
    if (!webSocket.isConnected() || deviceState != LISTENING) {
      return;
@@ -619,7 +645,7 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    // Configure I2S for PDM microphone with proper settings
    auto i2sConfig = i2sInput.defaultConfig(RX_MODE);
    i2sConfig.bits_per_sample = BITS_PER_SAMPLE;
-   i2sConfig.sample_rate = 16000; 
+   i2sConfig.sample_rate = SAMPLE_RATE;  // Use constant instead of hardcoded value
    i2sConfig.channels = CHANNELS;
    i2sConfig.i2s_format = I2S_PCM;
    i2sConfig.signal_type = PDM;
@@ -706,9 +732,10 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
          }
        }
 
-       // Use StreamCopy for efficient audio transmission when VAD allows
+       // Use StreamCopy for efficient ADPCM-compressed audio transmission when VAD allows
        if (vadShouldStream) {
-         micToWsCopier.copyBytes(MIC_COPY_SIZE);
+         micToAdpcmCopier.copyBytes(MIC_COPY_SIZE);
+         checkADPCMMemory(); // Monitor memory usage
        }
 
        vTaskDelay(1);

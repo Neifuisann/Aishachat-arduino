@@ -15,6 +15,7 @@
 #include "AudioTools/AudioCodecs/CodecOpus.h"
 #include <WebSocketsClient.h>
 #include "VAD.h"
+#include "ADPCM.h"  // Add ADPCM support
 
 // -------------- External Declarations --------------
 extern SemaphoreHandle_t wsMutex;
@@ -59,7 +60,10 @@ extern bool vadDebugEnabled;
 
 // Microphone streaming objects
 extern I2SStream i2sInput;
-extern StreamCopy micToWsCopier;
+extern StreamCopy micToAdpcmCopier;  // Updated to use ADPCM
+
+// ADPCM encoder/decoder objects
+extern ADPCMEncoderStream adpcmEncoder;
 
 // -------------- Functions --------------
 
@@ -79,6 +83,7 @@ bool isHighPassFilterEnabled();
 
 // PCM raw binary transmission function
 void sendPCMFrameRaw(const int16_t* frame, size_t frameSize);
+void sendPCMFrameADPCM(const int16_t* frame, size_t frameSize);  // ADPCM compressed version
 
 // Speaker / listening transitions
 unsigned long getSpeakingDuration();
