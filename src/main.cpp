@@ -139,6 +139,9 @@ void setup()
     // SETUP
     setupDeviceMetadata();
 
+    // Camera (can run after tasks are created)
+    init_camera_once();
+
     // Mount SPIFFS *before* creating tasks that might use it
     if(!SPIFFS.begin(true)) { // Use format SPIFFS if not mounted
         Serial.println("SPIFFS Mount Failed! Halting.");
@@ -146,6 +149,39 @@ void setup()
     } else {
         Serial.println("SPIFFS Mounted.");
     }
+
+    // Check initial memory before any major allocations
+    Serial.printf("Free heap before WiFi setup: %d bytes\n", ESP.getFreeHeap());
+
+    // WIFI - Initialize first to avoid memory fragmentation
+    setupWiFi();
+
+    // Wait for WiFi connection before creating memory-intensive audio tasks
+    Serial.println("Waiting for WiFi connection before starting audio tasks...");
+    unsigned long wifiWaitStart = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - wifiWaitStart) < 30000) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\nWiFi connected! Free heap: %d bytes\n", ESP.getFreeHeap());
+    } else {
+        Serial.printf("\nWiFi connection timeout. Free heap: %d bytes\n", ESP.getFreeHeap());
+    }
+
+    // Pin network task to Core 0 (protocol core) - Create first as it's most critical
+    xTaskCreatePinnedToCore(
+        networkTask,       // Function
+        "Websocket Task",  // Name
+        8192,              // Stack size
+        NULL,              // Parameters
+        configMAX_PRIORITIES-1, // Highest priority
+        &networkTaskHandle,// Handle
+        0                  // Core 0 (protocol core)
+    );
+
+    Serial.printf("Free heap after network task: %d bytes\n", ESP.getFreeHeap());
 
     xTaskCreatePinnedToCore(
         audioStreamTask,   // Function
@@ -157,34 +193,21 @@ void setup()
         1                  // Core 1 (application core)
     );
 
+    Serial.printf("Free heap after speaker task: %d bytes\n", ESP.getFreeHeap());
+
     xTaskCreatePinnedToCore(
         micTask,           // Function
         "Microphone Task", // Name
-        4096,              // Stack size
+        4096,             // Stack size 
         NULL,              // Parameters
         4,                 // Priority
         NULL,              // Handle
         1                  // Core 1 (application core)
     );
 
-    // Pin network task to Core 0 (protocol core)
-    xTaskCreatePinnedToCore(
-        networkTask,       // Function
-        "Websocket Task",  // Name
-        8192,              // Stack size
-        NULL,              // Parameters
-        configMAX_PRIORITIES-1, // Highest priority
-        &networkTaskHandle,// Handle
-        0                  // Core 0 (protocol core)
-    );
-    
+    Serial.printf("Free heap after microphone task: %d bytes\n", ESP.getFreeHeap());
 
-
-    // WIFI
-    setupWiFi();
-
-    // Camera (can run after tasks are created)
-    init_camera_once();
+    delay(1000);
 }
 
 void loop(){

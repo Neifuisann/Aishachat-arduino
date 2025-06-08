@@ -9,7 +9,10 @@
  #include "AudioTools/AudioCodecs/CodecOpus.h"
  #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
  #include <WebSocketsClient.h>
+ #include <ArduinoJson.h>
  #include "Audio.h"
+ #include "PitchShift.h"
+ #include "VADConfig.h"
  #include <math.h>
  #include "SPIFFS.h"
  #include <stdlib.h> // Required for rand() and srand()
@@ -42,13 +45,14 @@
  const unsigned long LIMIT_SOUND_RETRY_DELAY = 10000; // ms delay between limit sounds
  
  // -------------- AUDIO SETTINGS --------------
- int currentVolume = 70;
+ int currentVolume = 100;
+ float currentPitchFactor = 1.0f;
  const int CHANNELS = 1;         // Mono
  const int BITS_PER_SAMPLE = 16; // 16-bit audio
  
  // -------------- OUTPUT (TTS) --------------
  BufferRTOS<uint8_t> audioBuffer(AUDIO_BUFFER_SIZE, AUDIO_CHUNK_SIZE);
- OpusAudioDecoder opusDecoder;
+ OpusAudioDecoder opusDecoder;  // Keep for incoming TTS audio
  MP3DecoderHelix mp3Decoder;
  File processingSoundFile;
  
@@ -93,7 +97,12 @@
  QueueStream<uint8_t> queue(audioBuffer);
  StreamCopy copier(volume, queue);
  
- // Audio info for speaker
+ // NEW for pitch shift (lossy)Add commentMore actions
+PitchShiftFixedOutput pitchShift(i2s);
+VolumeStream volumePitch(pitchShift); //access from audioStreamTask only
+StreamCopy pitchCopier(volumePitch, queue);
+ 
+ // Audio info for speaker - Use 24kHz to match Gemini TTS output
  AudioInfo info(24000, CHANNELS, BITS_PER_SAMPLE);
  
  // -------------- MICROPHONE INPUT --------------
@@ -123,10 +132,52 @@
    }
  };
  
- static WebsocketStream wsStream;
- static I2SStream i2sInput;
- static StreamCopy micToWsCopier(wsStream, i2sInput);
+ static WebsocketStream rawWsStream;  // For raw PCM transmission
+ I2SStream i2sInput;  // Remove static since it's declared extern in header
  static const int MIC_COPY_SIZE = 64; // chunk size for mic -> WS
+ StreamCopy micToWsCopier(rawWsStream, i2sInput); // Direct mic -> WebSocket streaming
+
+ // VAD (Voice Activity Detection) components
+ VoiceActivityDetector vad;
+ int16_t* vadFrameBuffer = nullptr;
+ uint16_t vadFrameIndex = 0;
+ bool vadDebugEnabled = false;  // Temporarily enabled for debugging
+ static unsigned long lastVadDebugTime = 0;
+ static const unsigned long VAD_DEBUG_INTERVAL = VAD_DEBUG_INTERVAL_MS;
+
+ // VAD state tracking for audio streaming
+ static bool vadShouldStream = false;
+ static bool vadPrefixSent = false;
+
+ void sendPCMFrameRaw(const int16_t* frame, size_t frameSize) {
+   if (!webSocket.isConnected() || deviceState != LISTENING) {
+     return;
+   }
+
+   // Send raw PCM data directly as binary WebSocket message
+   size_t pcmDataSize = frameSize * sizeof(int16_t);
+   const uint8_t* pcmBytes = (const uint8_t*)frame;
+
+   const size_t PCM_CHUNK_SIZE = 64;
+   size_t bytesRemaining = pcmDataSize;
+   size_t offset = 0;
+
+   while (bytesRemaining > 0) {
+     size_t chunkSize = (bytesRemaining > PCM_CHUNK_SIZE) ? PCM_CHUNK_SIZE : bytesRemaining;
+
+     if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+       webSocket.sendBIN(pcmBytes + offset, chunkSize);
+       xSemaphoreGive(wsMutex);
+     }
+
+     offset += chunkSize;
+     bytesRemaining -= chunkSize;
+   }
+ }
+
+// Audio gain control variables
+static float currentMicGain = 2.0f;  // Default PDM gain factor
+static bool highPassEnabled = true;  // Default high-pass filter enabled
  
  // -----------------------------------------------------------------------------
  // UTILITY: how long have we been speaking?
@@ -173,6 +224,7 @@
        audioBuffer.reset();
        i2s.flush();
        volume.flush();
+       volumePitch.flush();
        queue.flush();
 
        // *** Now change state ***
@@ -186,7 +238,7 @@
 
        opusDecoder.setOutput(bufferPrint);
 
-       webSocket.enableHeartbeat(60000, 30000, 3);
+       //webSocket.enableHeartbeat(60000, 30000, 3);
        xSemaphoreGive(wsMutex);
 
    } else {
@@ -225,15 +277,23 @@
       // Flush streams and reset TTS buffer
       i2s.flush();
       volume.flush();
+      volumePitch.flush();
       queue.flush();
       i2sInput.flush(); // Mic input
       audioBuffer.reset();
  
-      webSocket.disableHeartbeat();
+      //webSocket.disableHeartbeat();
       xSemaphoreGive(wsMutex);
  
       // Set final state after releasing mutex
       deviceState = LISTENING;
+
+      // Reset VAD when transitioning to listening
+      vad.reset();
+      vadFrameIndex = 0;
+      vadShouldStream = false;
+      vadPrefixSent = false;
+
       Serial.println("Transitioned to listening mode");
  
    } else {
@@ -308,7 +368,18 @@
    Serial.println("Starting speaker pipeline...");
    srand(time(NULL));
  
-   // Opus Setup (Output initially to bufferPrint)
+   // Wait for WiFi connection before initializing memory-intensive Opus codec
+   Serial.println("Waiting for WiFi connection before initializing Opus decoder...");
+   unsigned long opusWaitStart = millis();
+   while (WiFi.status() != WL_CONNECTED && (millis() - opusWaitStart) < 60000) {
+     vTaskDelay(1000);
+     Serial.print(".");
+   }
+
+   if (WiFi.status() == WL_CONNECTED) {
+     Serial.printf("\nWiFi connected! Free heap before Opus decoder init: %d bytes\n", ESP.getFreeHeap());
+ 
+   // Use 24kHz to match Gemini TTS output
    OpusSettings cfg;
    cfg.sample_rate = 24000;
    cfg.channels = CHANNELS;
@@ -316,6 +387,11 @@
    cfg.max_buffer_size = 6144; // Adjust if needed
    opusDecoder.setOutput(bufferPrint); // Default output
    opusDecoder.begin(cfg);
+
+     Serial.printf("Opus decoder initialized successfully. Free heap: %d bytes\n", ESP.getFreeHeap());
+   } else {
+     Serial.println("\nWiFi connection timeout - proceeding without Opus decoder");
+   }
  
    // MP3 Setup (Output initially NULL, will be set dynamically)
    mp3Decoder.begin();
@@ -336,11 +412,15 @@
    i2s.begin(i2sCfg);
  
    auto vcfg = volume.defaultConfig();
-   vcfg.copyFrom(i2sCfg);
+   vcfg.copyFrom(info);
    vcfg.allow_boost = true; // Or false if not needed
    volume.begin(vcfg);
    volume.setVolume(currentVolume / 100.0f); // Set initial volume
  
+   auto vcfgPitch = volumePitch.defaultConfig();
+   vcfgPitch.copyFrom(info);
+   vcfgPitch.allow_boost = true;
+   volumePitch.begin(vcfgPitch);
  
    // Main Loop
    while (1) {
@@ -477,7 +557,11 @@
  
          // Copy data from the Opus/TTS buffer to the output
          // This handles the actual TTS playback
-         copier.copy();
+          if (currentPitchFactor != 1.0f && currentPitchFactor >= 0.5f && currentPitchFactor <= 2.0f) {
+              pitchCopier.copy();
+          } else {
+              copier.copy();  // Use normal path for extreme pitch factors or 1.0f
+          }
  
          // Adjust delays based on state
          if (deviceState != SPEAKING && deviceState != QUOTA_EXCEEDED) { 
@@ -501,8 +585,38 @@
  }
  
  void micTask(void *parameter) {
-   Serial.println("Starting microphone pipeline...");
- 
+   Serial.println("Starting microphone pipeline with VAD...");
+
+   // Check initial stack usage
+   UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+   Serial.printf("Microphone task initial stack free: %d bytes\n", stackHighWaterMark * sizeof(StackType_t));
+
+   // Wait for WiFi connection before proceeding
+   Serial.println("Waiting for WiFi connection...");
+   unsigned long wifiWaitStart = millis();
+   while (WiFi.status() != WL_CONNECTED && (millis() - wifiWaitStart) < 60000) {
+     vTaskDelay(1000);
+     Serial.print(".");
+   }
+
+   if (WiFi.status() == WL_CONNECTED) {
+     Serial.printf("\nWiFi connected! Free heap: %d bytes\n", ESP.getFreeHeap());
+   } else {
+     Serial.println("\nWiFi connection timeout - proceeding anyway");
+   }
+
+   // Use aligned allocation for VAD frame buffer
+   VADConfig vadConfig;
+   vadFrameBuffer = (int16_t*)heap_caps_aligned_alloc(4, sizeof(int16_t) * vadConfig.frameSize, MALLOC_CAP_DEFAULT);
+   if (!vadFrameBuffer) {
+     Serial.println("Failed to allocate aligned VAD frame buffer!");
+     vTaskDelete(NULL);
+     return;
+   }
+   Serial.printf("VAD frame buffer allocated (%d samples for 20ms, 4-byte aligned). Free heap: %d bytes\n",
+                 vadConfig.frameSize, ESP.getFreeHeap());
+
+   // Configure I2S for PDM microphone with proper settings
    auto i2sConfig = i2sInput.defaultConfig(RX_MODE);
    i2sConfig.bits_per_sample = BITS_PER_SAMPLE;
    i2sConfig.sample_rate = 16000; 
@@ -514,14 +628,89 @@
    i2sConfig.pin_bck  = I2S_PIN_NO_CHANGE;
    i2sConfig.port_no  = I2S_PORT_IN;
    i2sInput.begin(i2sConfig);
+
+   Serial.println("PDM microphone configured with optimized settings");
+   Serial.println("VAD initialized - 200ms prefix, 800ms silence detection (20ms frames)");
+   Serial.printf("Audio processing: Raw PCM 16kHz 16-bit direct streaming\n");
+   Serial.printf("PCM frames: %d samples/frame (20ms), Sample rate: %d Hz\n",
+                 vadConfig.frameSize, VAD_SAMPLE_RATE);
+
+   // Buffer for VAD processing (separate from streaming)
+   uint8_t vadSampleBuffer[MIC_COPY_SIZE];
+
+   // Audio level monitoring
+   static unsigned long lastAudioLevelReport = 0;
+   static float maxAudioLevel = 0.0f;
+   static float avgAudioLevel = 0.0f;
+   static int audioSampleCount = 0;
+
+   // Stack monitoring variables
+   static unsigned long lastStackCheck = 0;
+   static const unsigned long STACK_CHECK_INTERVAL = 30000; // Check every 30 seconds
  
    while (1) {
+     // Periodic stack monitoring
+     if (millis() - lastStackCheck > STACK_CHECK_INTERVAL) {
+       UBaseType_t stackFree = uxTaskGetStackHighWaterMark(NULL);
+       Serial.printf("Microphone task stack free: %d bytes\n", stackFree * sizeof(StackType_t));
+       lastStackCheck = millis();
+     }
+
      if (scheduleListeningRestart && millis() >= scheduledTime) {
        transitionToListening();
      }
  
      if (deviceState == LISTENING && webSocket.isConnected()) {
-       micToWsCopier.copyBytes(MIC_COPY_SIZE);
+       // Simple VAD processing for speech detection
+       size_t bytesRead = i2sInput.readBytes(vadSampleBuffer, MIC_COPY_SIZE);
+
+       if (bytesRead > 0) {
+         // Convert bytes to 16-bit samples for VAD analysis only
+         for (size_t i = 0; i < bytesRead && i < MIC_COPY_SIZE; i += 2) {
+           if (vadFrameIndex < vadConfig.frameSize) {
+             // Convert little-endian bytes to int16_t
+             int16_t sample = (int16_t)((vadSampleBuffer[i+1] << 8) | vadSampleBuffer[i]);
+             vadFrameBuffer[vadFrameIndex] = sample;
+             vadFrameIndex++;
+           }
+         }
+
+         // Process complete frames through VAD
+         if (vadFrameIndex >= vadConfig.frameSize) {
+           bool sendPrefixBuffer = false;
+           bool shouldSendFrame = vad.processFrame(vadFrameBuffer, sendPrefixBuffer);
+
+           // Update VAD streaming state
+           if (sendPrefixBuffer && !vadPrefixSent) {
+             vadShouldStream = true;
+             vadPrefixSent = true;
+             Serial.printf("VAD: Speech started - enabling audio stream\n");
+           }
+
+           if (!shouldSendFrame && vadShouldStream) {
+             vadShouldStream = false;
+             vadPrefixSent = false;
+             Serial.printf("VAD: Speech ended - disabling audio stream\n");
+           }
+
+           // Debug output
+           if (vadDebugEnabled && (millis() - lastVadDebugTime) > 1000) {
+             Serial.printf("VAD: State=%d, Energy=%.1f, Streaming=%s\n",
+                          vad.getState(), vad.getCurrentEnergy(),
+                          vadShouldStream ? "YES" : "NO");
+             lastVadDebugTime = millis();
+           }
+
+           // Reset frame buffer
+           vadFrameIndex = 0;
+         }
+       }
+
+       // Use StreamCopy for efficient audio transmission when VAD allows
+       if (vadShouldStream) {
+         micToWsCopier.copyBytes(MIC_COPY_SIZE);
+       }
+
        vTaskDelay(1);
      } else {
        vTaskDelay(10);
@@ -556,8 +745,27 @@
  
        String typeS = doc["type"];
        if (typeS == "auth") {
-         currentVolume = doc["volume_control"] | 70;
+          currentVolume = doc["volume_control"].as<int>();
+          currentPitchFactor = doc["pitch_factor"].as<float>();
+
+          bool is_ota = doc["is_ota"].as<bool>();
+          bool is_reset = doc["is_reset"].as<bool>();
+
+          // Update volumes on both streams
          volume.setVolume(currentVolume / 100.0f);
+          volumePitch.setVolume(currentVolume / 100.0f);
+          
+          // Only initialize pitch shift if needed and within safe range
+          if (currentPitchFactor != 1.0f && currentPitchFactor >= 0.5f && currentPitchFactor <= 2.0f) {
+              auto pcfg = pitchShift.defaultConfig();
+              pcfg.copyFrom(info);
+              pcfg.pitch_shift = currentPitchFactor;
+              pcfg.buffer_size = 1024;  // Match GRAINSIZE in PitchShift.cpp
+              pitchShift.begin(pcfg);
+              Serial.printf("Pitch shift initialized with factor: %.2f\n", currentPitchFactor);
+          } else if (currentPitchFactor != 1.0f) {
+              Serial.printf("Pitch factor %.2f out of safe range (0.5-2.0), using normal audio\n", currentPitchFactor);
+          }
        }
        else if (typeS == "server") {
          String msg = doc["msg"] | "";
@@ -566,7 +774,7 @@
          if (msg == "RESPONSE.COMPLETE" || msg == "RESPONSE.ERROR") {
            Serial.println("Server => done speaking => Listening");
            if (doc.containsKey("volume_control")) {
-             int newVol = doc["volume_control"] | 70;
+             int newVol = doc["volume_control"] | 100;
              volume.setVolume(newVol / 100.0f);
            }
            scheduleListeningRestart = true;
@@ -596,6 +804,7 @@
               audioBuffer.reset();
               i2s.flush();
               volume.flush();
+              volumePitch.flush();
               queue.flush();
               isPlayingLimitSound = false;
               lastLimitSoundStartTime = 0;
@@ -652,8 +861,8 @@
    webSocket.setExtraHeaders(headers.c_str());
    webSocket.onEvent(webSocketEvent);
    webSocket.setReconnectInterval(1000);
- 
-   webSocket.enableHeartbeat(60000, 30000, 3);
+   webSocket.disableHeartbeat();
+   //webSocket.enableHeartbeat(60000, 30000, 3);
  
  #ifdef DEV_MODE
    webSocket.begin(server_domain.c_str(), port, path.c_str());
@@ -716,5 +925,64 @@
 
      // 6. Release Mutex
      xSemaphoreGive(mp3Mutex);
+ }
+
+ // -----------------------------------------------------------------------------
+ // VAD UTILITY FUNCTIONS
+ // -----------------------------------------------------------------------------
+ void setVADThresholds(float speechThreshold, float silenceThreshold) {
+   vad.setThresholds(speechThreshold, silenceThreshold);
+   Serial.printf("VAD thresholds updated: Speech=%.1f, Silence=%.1f\n",
+                speechThreshold, silenceThreshold);
+ }
+
+ void enableVADDebug(bool enable) {
+   vadDebugEnabled = enable;
+   Serial.printf("VAD debug %s\n", enable ? "enabled" : "disabled");
+ }
+
+ void startVADCalibration(uint16_t durationMs) {
+   vad.startCalibration(durationMs);
+ }
+
+ void getVADCalibrationResults(float& avgSilence, float& maxSilence, float& suggestedSpeechThreshold) {
+   vad.getCalibrationResults(avgSilence, maxSilence, suggestedSpeechThreshold);
+ }
+
+ void printVADStatus() {
+   vad.printDebugInfo();
+ }
+
+ void autoTuneVADThresholds() {
+   // Based on current background noise level (~1295), set appropriate thresholds
+   float currentEnergy = vad.getCurrentEnergy();
+   float speechThreshold = currentEnergy + 500.0f;  // 500 above background
+   float silenceThreshold = currentEnergy + 100.0f; // 100 above background
+
+   setVADThresholds(speechThreshold, silenceThreshold);
+   Serial.printf("VAD auto-tuned based on current energy %.1f\n", currentEnergy);
+ }
+
+// Audio gain control functions
+void setMicrophoneGain(float gainFactor) {
+  if (gainFactor >= 0.1f && gainFactor <= 20.0f) {
+    currentMicGain = gainFactor;
+    Serial.printf("Microphone gain set to %.2f\n", gainFactor);
+  } else {
+    Serial.printf("Invalid gain factor %.2f (must be 0.1-20.0)\n", gainFactor);
+  }
+}
+
+float getMicrophoneGain() {
+  return currentMicGain;
+}
+
+void enableHighPassFilter(bool enable) {
+  highPassEnabled = enable;
+  Serial.printf("High-pass filter %s\n", enable ? "enabled" : "disabled");
+}
+
+bool isHighPassFilterEnabled() {
+  return highPassEnabled;
  }
  

@@ -14,6 +14,7 @@
 #include "AudioTools.h"
 #include "AudioTools/AudioCodecs/CodecOpus.h"
 #include <WebSocketsClient.h>
+#include "VAD.h"
 
 // -------------- External Declarations --------------
 extern SemaphoreHandle_t wsMutex;
@@ -43,16 +44,41 @@ extern I2SStream i2s;
 extern VolumeStream volume;
 extern QueueStream<uint8_t> queue;
 extern StreamCopy copier;
+
+// NEW for pitch shift
+extern VolumeStream volumePitch;
+extern StreamCopy pitchCopier;
+
 extern AudioInfo info;
 
-// For microphone input
-// (We define them in Audio.cpp; no need for extern if you prefer.)
-//
-// However, if you want to share them in other .cpp, you can mark them extern here.
-// extern I2SStream i2sInput;
-// extern StreamCopy micToWsCopier;
+// For microphone input with VAD
+extern VoiceActivityDetector vad;
+extern int16_t* vadFrameBuffer;
+extern uint16_t vadFrameIndex;
+extern bool vadDebugEnabled;
+
+// Microphone streaming objects
+extern I2SStream i2sInput;
+extern StreamCopy micToWsCopier;
 
 // -------------- Functions --------------
+
+// VAD functions
+void setVADThresholds(float speechThreshold, float silenceThreshold);
+void enableVADDebug(bool enable);
+void startVADCalibration(uint16_t durationMs = 5000);
+void getVADCalibrationResults(float& avgSilence, float& maxSilence, float& suggestedSpeechThreshold);
+void printVADStatus();
+void autoTuneVADThresholds();
+
+// Audio gain control functions
+void setMicrophoneGain(float gainFactor);
+float getMicrophoneGain();
+void enableHighPassFilter(bool enable);
+bool isHighPassFilterEnabled();
+
+// PCM raw binary transmission function
+void sendPCMFrameRaw(const int16_t* frame, size_t frameSize);
 
 // Speaker / listening transitions
 unsigned long getSpeakingDuration();
