@@ -9,23 +9,46 @@
 #include <WiFiClientSecure.h>
 #include <WebSocketsClient.h>
 
+// ---------- CHOOSE YOUR MODE ----------
+// Pick one of the following (DEV_MODE, PROD_MODE, ELATO_MODE) , comment the rest
+// For ELATO_MODE, you will need to register your DIY Hardware on the Elato website
+
+#define DEV_MODE
+// #define PROD_MODE
+// #define ELATO_MODE
+
+
+// ---------- Touch mode ----------
+// If you want to use the touch sensor to wake up the device, uncomment the following line
+// If you want to use the button to wake up the device, comment the following line
+#define TOUCH_MODE
+
 extern Preferences preferences;
 extern bool factory_reset_status;
+
+enum OtaStatus {
+    OTA_IDLE,
+    OTA_IN_PROGRESS,
+    OTA_COMPLETE
+};
+
+extern OtaStatus otaState;
 
 enum DeviceState
 {
     SETUP,
+    SOFT_AP,
     IDLE,
     LISTENING,
     SPEAKING,
-    TAKING_PHOTO,
     PROCESSING,
     WAITING,
-    QUOTA_EXCEEDED,
-    FACTORY_RESET
+    OTA,
+    FACTORY_RESET,
+    SLEEP
 };
 
-extern DeviceState deviceState;
+extern volatile DeviceState deviceState;
 
 // WiFi credentials
 extern const char *EAP_IDENTITY;
@@ -50,30 +73,17 @@ extern const uint16_t backend_port;
 // I2S and Audio parameters
 extern const uint32_t SAMPLE_RATE;
 
-// ---------- Development ------------
-// #define DEV_MODE
+extern const int BLUE_LED_PIN;
+extern const int RED_LED_PIN;
+extern const int GREEN_LED_PIN;
 
-// ─── HIGH-LEVEL SWITCHES ─────────────────────────────────────────
-#define TTP_GPIO_WAKE            // we have a capacitive key, not a push-button
-#define USE_XIAO_S3_SENSE     // our pin-map
-#define USE_PDM_MIC           // mic is PDM, not classic I²S
-
-// ----------------- Pin Definitions -----------------
-// #define USE_NORMAL_ESP32
-
-//extern const gpio_num_t BUTTON_PIN;
+extern const gpio_num_t BUTTON_PIN;
 
 // I2S Microphone pins
 extern const int I2S_SD;
 extern const int I2S_WS;
 extern const int I2S_SCK;
 extern const i2s_port_t I2S_PORT_IN;
-
-#ifdef USE_PDM_MIC        // only needed when the PDM mic option is active
-extern const int PDM_CLK;   // GPIO 42 on XIAO-S3 Sense
-extern const int PDM_DATA;  // GPIO 41 on XIAO-S3 Sense
-#endif
-
 
 // I2S Speaker pins
 extern const int I2S_WS_OUT;

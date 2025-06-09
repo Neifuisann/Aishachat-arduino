@@ -114,9 +114,19 @@ StreamCopy pitchCopier(volumePitch, queue);
      if (!webSocket.isConnected() || deviceState != LISTENING) {
        return 1;
      }
+
+     // Check if mutex is valid before using it
+     if (wsMutex == NULL) {
+       Serial.println("ERROR: wsMutex is NULL in ADPCMWebsocketStream::write(byte)");
+       return 0;
+     }
+
      if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
        webSocket.sendBIN(&b, 1);
        xSemaphoreGive(wsMutex);
+     } else {
+       Serial.println("WARNING: Failed to acquire wsMutex in ADPCMWebsocketStream::write(byte)");
+       return 0;
      }
      return 1;
    }
@@ -125,9 +135,19 @@ StreamCopy pitchCopier(volumePitch, queue);
      if (!webSocket.isConnected() || deviceState != LISTENING) {
        return size;
      }
+
+     // Check if mutex is valid before using it
+     if (wsMutex == NULL) {
+       Serial.println("ERROR: wsMutex is NULL in ADPCMWebsocketStream::write(buffer)");
+       return 0;
+     }
+
      if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
        webSocket.sendBIN(buffer, size);
        xSemaphoreGive(wsMutex);
+     } else {
+       Serial.println("WARNING: Failed to acquire wsMutex in ADPCMWebsocketStream::write(buffer)");
+       return 0;
      }
      return size;
    }
@@ -218,116 +238,81 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
  // -----------------------------------------------------------------------------
  // TRANSITIONS
  // -----------------------------------------------------------------------------
+ // Simple transitionToSpeaking like old implementation (no mutex - called from networkTask that already holds it)
  void transitionToSpeaking() {
-   // 1. Signal audioStreamTask to stop playing any current sound
-   bool needsTransition = false;
-   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (deviceState != SPEAKING && deviceState != QUOTA_EXCEEDED) {
-           isPlayingProcessingSound = false;
-           isPlayingLimitSound = false;
-           needsTransition = true;
-           if (processingSoundFile) {
-               processingSoundFile.close();
-           }
-       } else if (deviceState == QUOTA_EXCEEDED) {
-           isPlayingLimitSound = false;
-           needsTransition = true;
-           if (processingSoundFile) {
-               processingSoundFile.close();
-           }
-       }
-       xSemaphoreGive(wsMutex);
+   vTaskDelay(50);
+
+   // Stop any current sounds
+   if (deviceState != SPEAKING && deviceState != QUOTA_EXCEEDED) {
+      isPlayingProcessingSound = false;
+      isPlayingLimitSound = false;
+      if (processingSoundFile) {
+          processingSoundFile.close();
+      }
+   } else if (deviceState == QUOTA_EXCEEDED) {
+      isPlayingLimitSound = false;
+      if (processingSoundFile) {
+          processingSoundFile.close();
+      }
    }
 
-   if (!needsTransition) {
-     return; // Already speaking or failed mutex
-   }
+   // Reset TTS buffer
+   audioBuffer.reset();
+   i2s.flush();
+   volume.flush();
+   volumePitch.flush();
+   queue.flush();
 
-   // 3. Now perform the main transition under wsMutex lock
-   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+   // Change state
+   deviceState = SPEAKING;
+   speakingStartTime = millis();
+   transitionToSpeakingTimestamp = millis();
+   realAudioArrived = false;
+   isPlayingProcessingSound = false;
+   isPlayingLimitSound = false;
+   processingSoundFinished = false;
 
-       // *** Reset only the TTS buffer ***
-       audioBuffer.reset();
-       i2s.flush();
-       volume.flush();
-       volumePitch.flush();
-       queue.flush();
+   opusDecoder.setOutput(bufferPrint);
 
-       // *** Now change state ***
-       deviceState = SPEAKING;
-       speakingStartTime = millis();
-       transitionToSpeakingTimestamp = millis();
-       realAudioArrived = false;
-       isPlayingProcessingSound = false;
-       isPlayingLimitSound = false;
-       processingSoundFinished = false;
-
-       opusDecoder.setOutput(bufferPrint);
-
-       //webSocket.enableHeartbeat(60000, 30000, 3);
-       xSemaphoreGive(wsMutex);
-
-   } else {
-       Serial.println("TransitionToSpeaking: Failed to get ws mutex!");
-   }
+   Serial.println("Transitioned to speaking mode");
  }
  
+ // Simple transitionToListening like old implementation (no mutex - called from networkTask that already holds it)
  void transitionToListening() {
-   bool wasPlayingMp3 = false;
-   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-       if (deviceState == QUOTA_EXCEEDED || isPlayingProcessingSound || isPlayingLimitSound) {
-           wasPlayingMp3 = true;
-           Serial.println("Stopping MP3 sound due to transitionToListening.");
-           isPlayingLimitSound = false;
-           isPlayingProcessingSound = false;
-           if (processingSoundFile) {
-               processingSoundFile.close();
-           }
+   // Stop any MP3 sounds
+   if (deviceState == QUOTA_EXCEEDED || isPlayingProcessingSound || isPlayingLimitSound) {
+       Serial.println("Stopping MP3 sound due to transitionToListening.");
+       isPlayingLimitSound = false;
+       isPlayingProcessingSound = false;
+       if (processingSoundFile) {
+           processingSoundFile.close();
        }
-       realAudioArrived = false; // Reset this too
-       processingSoundFinished = false;
-       xSemaphoreGive(wsMutex);
    }
- 
-   // Give audio task time to stop if it was playing MP3
-   if (wasPlayingMp3) {
-       vTaskDelay(pdMS_TO_TICKS(10));
-   }
- 
- 
-   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      deviceState = PROCESSING; // Intermediate state before LISTENING
-      scheduleListeningRestart = false;
-      Serial.println("Transitioning to listening mode");
- 
-      // Flush streams and reset TTS buffer
-      i2s.flush();
-      volume.flush();
-      volumePitch.flush();
-      queue.flush();
-      i2sInput.flush(); // Mic input
-      audioBuffer.reset();
- 
-      //webSocket.disableHeartbeat();
-      xSemaphoreGive(wsMutex);
- 
-      // Set final state after releasing mutex
-      deviceState = LISTENING;
 
-      // Reset VAD when transitioning to listening
-      vad.reset();
-      vadFrameIndex = 0;
-      vadShouldStream = false;
-      vadPrefixSent = false;
+   realAudioArrived = false;
+   processingSoundFinished = false;
+   scheduleListeningRestart = false;
 
-      Serial.println("Transitioned to listening mode");
- 
-   } else {
-      Serial.println("TransitionToListening: Failed to get wsMutex");
-      // Attempt to force state anyway? Or just log error? For now, log.
-      // Maybe set state directly if mutex fails? Risky.
-      deviceState = LISTENING; // Force state change if mutex fails?
-   }
+   deviceState = PROCESSING; // Intermediate state before LISTENING
+   Serial.println("Transitioning to listening mode");
+
+   // Flush streams and reset TTS buffer
+   i2s.flush();
+   volume.flush();
+   volumePitch.flush();
+   queue.flush();
+   i2sInput.flush(); // Mic input
+   audioBuffer.reset();
+
+   Serial.println("Transitioned to listening mode");
+
+   deviceState = LISTENING;
+
+   // Reset VAD when transitioning to listening
+   vad.reset();
+   vadFrameIndex = 0;
+   vadShouldStream = false;
+   vadPrefixSent = false;
  }
  
  void transitionToTakingPhoto() {
@@ -351,40 +336,84 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
   * For "REQUEST.PHOTO" => transitionToTakingPhoto -> captureAndSendPhotoBase64
   *******************************************************************************/
  void captureAndSendPhotoBase64() {
-   sensor_t* sensor = esp_camera_sensor_get();  
+   Serial.println("=== PHOTO CAPTURE DEBUG ===");
+   Serial.println("Step 1: Preparing camera...");
+
+   sensor_t* sensor = esp_camera_sensor_get();
+   if (!sensor) {
+     Serial.println("ERROR: Camera sensor not available!");
+     return;
+   }
+
    sensor->set_reg(sensor, 0x3008, 0xFF, 0x02); // from standby to ready
- 
+   Serial.println("Step 2: Camera set to ready mode");
+
    delay(1000);
- 
+
+   Serial.println("Step 3: Capturing image...");
    camera_fb_t *fb = nullptr;
-   
+
    fb = esp_camera_fb_get();
- 
+
+   // Critical: Check if camera capture was successful
+   if (!fb) {
+     Serial.println("ERROR: Camera capture failed! fb is NULL");
+     sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
+     return;
+   }
+
+   if (fb->len == 0) {
+     Serial.println("ERROR: Camera captured empty image!");
+     esp_camera_fb_return(fb);
+     sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
+     return;
+   }
+
+   Serial.printf("Step 4: Image captured successfully - %d bytes\n", fb->len);
+
    // base64-encode
    size_t encodedLen = base64_enc_len(fb->len);
    char *b64buf = (char*)malloc(encodedLen + 1);
- 
+
+   if (!b64buf) {
+     Serial.println("ERROR: Failed to allocate memory for base64 encoding!");
+     esp_camera_fb_return(fb);
+     sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
+     return;
+   }
+
+   Serial.println("Step 5: Converting to base64...");
    base64_encode(b64buf, (char*)fb->buf, fb->len);
    esp_camera_fb_return(fb);
- 
+
+   Serial.printf("Step 6: Base64 encoding complete - %d characters\n", strlen(b64buf));
+
    StaticJsonDocument<256> doc;
    doc["type"] = "image";
    doc["mime"] = "image/jpeg";
    doc["data"] = b64buf;
- 
+
    String json;
    serializeJson(doc, json);
    free(b64buf);
- 
+
+   Serial.printf("Step 7: JSON prepared - %d bytes\n", json.length());
+
    // Send to server
+   Serial.println("Step 8: Sending via WebSocket...");
    if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
      webSocket.sendTXT(json);
      xSemaphoreGive(wsMutex);
+     Serial.println("Step 9: Photo sent successfully!");
+   } else {
+     Serial.println("ERROR: Failed to acquire WebSocket mutex!");
    }
-   Serial.printf("Photo sent => %u bytes of JSON\n", json.length());
- 
-   sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // if you want standby again
+
+   Serial.printf("Photo capture complete => %u bytes of JSON sent\n", json.length());
+
+   sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
    delay(1000);
+   Serial.println("=== PHOTO CAPTURE COMPLETE ===");
  }
  
  // -----------------------------------------------------------------------------
@@ -394,17 +423,9 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    Serial.println("Starting speaker pipeline...");
    srand(time(NULL));
  
-   // Wait for WiFi connection before initializing memory-intensive Opus codec
-   Serial.println("Waiting for WiFi connection before initializing Opus decoder...");
-   unsigned long opusWaitStart = millis();
-   while (WiFi.status() != WL_CONNECTED && (millis() - opusWaitStart) < 60000) {
-     vTaskDelay(1000);
-     Serial.print(".");
-   }
+   // Initialize Opus decoder immediately (like old implementation - no WiFi wait)
+   Serial.printf("Free heap before Opus decoder init: %d bytes\n", ESP.getFreeHeap());
 
-   if (WiFi.status() == WL_CONNECTED) {
-     Serial.printf("\nWiFi connected! Free heap before Opus decoder init: %d bytes\n", ESP.getFreeHeap());
- 
    // Use 24kHz to match Gemini TTS output
    OpusSettings cfg;
    cfg.sample_rate = 24000;
@@ -414,10 +435,7 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    opusDecoder.setOutput(bufferPrint); // Default output
    opusDecoder.begin(cfg);
 
-     Serial.printf("Opus decoder initialized successfully. Free heap: %d bytes\n", ESP.getFreeHeap());
-   } else {
-     Serial.println("\nWiFi connection timeout - proceeding without Opus decoder");
-   }
+   Serial.printf("Opus decoder initialized successfully. Free heap: %d bytes\n", ESP.getFreeHeap());
  
    // MP3 Setup (Output initially NULL, will be set dynamically)
    mp3Decoder.begin();
@@ -617,19 +635,8 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
    Serial.printf("Microphone task initial stack free: %d bytes\n", stackHighWaterMark * sizeof(StackType_t));
 
-   // Wait for WiFi connection before proceeding
-   Serial.println("Waiting for WiFi connection...");
-   unsigned long wifiWaitStart = millis();
-   while (WiFi.status() != WL_CONNECTED && (millis() - wifiWaitStart) < 60000) {
-     vTaskDelay(1000);
-     Serial.print(".");
-   }
-
-   if (WiFi.status() == WL_CONNECTED) {
-     Serial.printf("\nWiFi connected! Free heap: %d bytes\n", ESP.getFreeHeap());
-   } else {
-     Serial.println("\nWiFi connection timeout - proceeding anyway");
-   }
+   // Initialize immediately (like old implementation - no WiFi wait)
+   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 
    // Use aligned allocation for VAD frame buffer
    VADConfig vadConfig;
@@ -682,10 +689,6 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
        lastStackCheck = millis();
      }
 
-     if (scheduleListeningRestart && millis() >= scheduledTime) {
-       transitionToListening();
-     }
- 
      if (deviceState == LISTENING && webSocket.isConnected()) {
        // Simple VAD processing for speech detection
        size_t bytesRead = i2sInput.readBytes(vadSampleBuffer, MIC_COPY_SIZE);
@@ -754,7 +757,7 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
        Serial.println("[WSc] Disconnected");
        deviceState = IDLE;
        break;
- 
+
      case WStype_CONNECTED:
        Serial.printf("[WSc] Connected => %s\n", payload);
        deviceState = PROCESSING;
@@ -870,40 +873,43 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
  // -----------------------------------------------------------------------------
  // WEBSOCKET SETUP + NETWORK TASK
  // -----------------------------------------------------------------------------
+ // Simple robust websocketSetup like the old implementation
  void websocketSetup(String server_domain, int port, String path) {
-   // wsMutex = xSemaphoreCreateMutex(); // <<< REMOVED Initialization
-   // mp3Mutex = xSemaphoreCreateMutex(); // <<< REMOVED Initialization
-
-   Serial.println("=== WEBSOCKET SETUP ===");
-   Serial.println("Server: " + server_domain + ":" + String(port) + path);
-
-   if (authTokenGlobal.isEmpty()) {
-     Serial.println("WARNING: Auth token is empty! WebSocket connection will likely fail.");
-     Serial.println("Authorization header: Bearer [EMPTY]");
-   } else {
-     Serial.println("Auth token: " + authTokenGlobal.substring(0, 20) + "...");
-   }
-
    String headers = "Authorization: Bearer " + String(authTokenGlobal);
+
+   xSemaphoreTake(wsMutex, portMAX_DELAY);
+
    webSocket.setExtraHeaders(headers.c_str());
    webSocket.onEvent(webSocketEvent);
    webSocket.setReconnectInterval(1000);
    webSocket.disableHeartbeat();
-   //webSocket.enableHeartbeat(60000, 30000, 3);
- 
- #ifdef DEV_MODE
-   webSocket.begin(server_domain.c_str(), port, path.c_str());
- #else
-   webSocket.beginSslWithCA(server_domain.c_str(), port, path.c_str(), CA_cert);
- #endif
 
-   Serial.println("WebSocket connection initiated");
-   Serial.println("======================");
+   // webSocket.enableHeartbeat(30000, 15000, 3); // 30s ping interval, 15s timeout, 3 retries
+
+   #ifdef DEV_MODE
+   webSocket.begin(server_domain.c_str(), port, path.c_str());
+   #else
+   webSocket.beginSslWithCA(server_domain.c_str(), port, path.c_str(), CA_cert);
+   #endif
+
+   xSemaphoreGive(wsMutex);
  }
  
+ // Simple robust networkTask like the old implementation
  void networkTask(void *parameter) {
+   Serial.println("Network task started");
+
    while (1) {
+     xSemaphoreTake(wsMutex, portMAX_DELAY);
+
+     // Check to see if a transition to listening mode is scheduled.
+     if (scheduleListeningRestart && millis() >= scheduledTime) {
+       transitionToListening();
+     }
+
      webSocket.loop();
+     xSemaphoreGive(wsMutex);
+
      vTaskDelay(1);
    }
  }

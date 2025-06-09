@@ -94,11 +94,11 @@ static void init_camera_once()
   cfg.pin_sscb_scl = SIOC_GPIO_NUM;
   cfg.pin_pwdn  = PWDN_GPIO_NUM;
   cfg.pin_reset = RESET_GPIO_NUM;
-  cfg.xclk_freq_hz = 10000000;
+  cfg.xclk_freq_hz = 20000000;
   cfg.grab_mode = CAMERA_GRAB_LATEST;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size = FRAMESIZE_XGA;     // 1024×768 = good compromise 
-  cfg.jpeg_quality = 24;              // 0–63 (lower = better quality)
+  cfg.frame_size = FRAMESIZE_VGA;     // 1024×768 = good compromise 
+  cfg.jpeg_quality = 10;              // 0–63 (lower = better quality)
   cfg.fb_location = CAMERA_FB_IN_PSRAM;
   cfg.fb_count = 2;
 
@@ -118,9 +118,20 @@ static void init_camera_once()
 }
 
 void setupDeviceMetadata() {
-    // Initialize mutexes early, before tasks start
+    // Initialize mutexes early, before tasks start - CRITICAL for thread safety
     wsMutex = xSemaphoreCreateMutex();
-    mp3Mutex = xSemaphoreCreateMutex(); // <<< Initialize MP3 Mutex here
+    if (wsMutex == NULL) {
+        Serial.println("FATAL: Failed to create wsMutex! System cannot continue.");
+        while(true) { delay(1000); } // Halt system
+    }
+    Serial.println("wsMutex created successfully");
+
+    mp3Mutex = xSemaphoreCreateMutex();
+    if (mp3Mutex == NULL) {
+        Serial.println("FATAL: Failed to create mp3Mutex! System cannot continue.");
+        while(true) { delay(1000); } // Halt system
+    }
+    Serial.println("mp3Mutex created successfully");
 
     // factoryResetDevice(); // Call this if needed before state checks
 
@@ -151,30 +162,14 @@ void setup()
     }
 
     // Check initial memory before any major allocations
-    Serial.printf("Free heap before WiFi setup: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Free heap before task creation: %d bytes\n", ESP.getFreeHeap());
 
-    // WIFI - Initialize first to avoid memory fragmentation
-    setupWiFi();
-
-    // Wait for WiFi connection before creating memory-intensive audio tasks
-    Serial.println("Waiting for WiFi connection before starting audio tasks...");
-    unsigned long wifiWaitStart = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - wifiWaitStart) < 30000) {
-        delay(500);
-        Serial.print(".");
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\nWiFi connected! Free heap: %d bytes\n", ESP.getFreeHeap());
-    } else {
-        Serial.printf("\nWiFi connection timeout. Free heap: %d bytes\n", ESP.getFreeHeap());
-    }
-
-    // Pin network task to Core 0 (protocol core) - Create first as it's most critical
+    // Create networkTask FIRST (like old implementation) - Critical for fast WebSocket connection
+    // This ensures networkTask is already running when connectCb() calls websocketSetup()
     xTaskCreatePinnedToCore(
         networkTask,       // Function
         "Websocket Task",  // Name
-        8192,              // Stack size
+        12288,             // Stack size (increased from 8192 for SSL)
         NULL,              // Parameters
         configMAX_PRIORITIES-1, // Highest priority
         &networkTaskHandle,// Handle
@@ -198,7 +193,7 @@ void setup()
     xTaskCreatePinnedToCore(
         micTask,           // Function
         "Microphone Task", // Name
-        16384,             // Stack size 
+        8192,             // Stack size
         NULL,              // Parameters
         4,                 // Priority
         NULL,              // Handle
@@ -207,7 +202,9 @@ void setup()
 
     Serial.printf("Free heap after microphone task: %d bytes\n", ESP.getFreeHeap());
 
-    delay(1000);
+    // WIFI - Setup AFTER tasks are created (like old implementation)
+    // This ensures networkTask is running when connectCb() is called
+    setupWiFi();
 }
 
 void loop(){

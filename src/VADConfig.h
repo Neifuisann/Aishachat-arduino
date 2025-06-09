@@ -7,12 +7,12 @@
 // Energy thresholds (may need tuning based on your microphone sensitivity)
 // Higher values = less sensitive (fewer false positives)
 // Lower values = more sensitive (may pick up background noise)
-#define VAD_SPEECH_THRESHOLD    1600.0f    // RMS energy threshold for speech start
+#define VAD_SPEECH_THRESHOLD    1500.0f    // RMS energy threshold for speech start
 #define VAD_SILENCE_THRESHOLD   1400.0f    // RMS energy threshold for speech end (hysteresis)
 
 // Timing parameters (in frames, where each frame = 20ms)
-#define VAD_PREFIX_FRAMES       10         // 200ms prefix padding (10 * 20ms)
-#define VAD_SILENCE_FRAMES      40        // 800ms silence detection (40 * 20ms)
+#define VAD_PREFIX_FRAMES       5         // 200ms prefix padding (10 * 20ms)
+#define VAD_SILENCE_FRAMES      10        // 800ms silence detection (10 * 20ms)
 #define VAD_MIN_SPEECH_FRAMES   5         // 100ms minimum speech duration (5 * 20ms)
 
 // Audio parameters - 20ms frames at 16kHz

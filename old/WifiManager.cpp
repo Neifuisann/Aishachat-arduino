@@ -6,6 +6,7 @@
  * (Attribution-NonCommercial-ShareAlike 4.0 International)
 **/
 #include "WifiManager.h"
+#include "OTA.h"
 #include "AsyncJson.h"
 #include "ArduinoJson.h"
 #include <WiFi.h>
@@ -18,15 +19,15 @@ bool isDeviceRegistered() {
   }
 
     HTTPClient http;
-    WiFiClientSecure client;
-    client.setCACert(Vercel_CA_cert);
 
     #ifdef DEV_MODE
-    http.begin("http://" + String(backend_server) + ":" + String(backend_port) +
-                 "/api/generate_auth_token?macAddress=" + WiFi.macAddress());
+      http.begin("http://" + String(backend_server) + ":" + String(backend_port) +
+                  "/api/generate_auth_token?macAddress=" + WiFi.macAddress());
     #else
-    http.begin(client, "https://" + String(backend_server) +
-                 "/api/generate_auth_token?macAddress=" + WiFi.macAddress());
+      WiFiClientSecure client;
+      client.setCACert(Vercel_CA_cert);
+      http.begin(client, "https://" + String(backend_server) +
+                  "/api/generate_auth_token?macAddress=" + WiFi.macAddress());
     #endif
 
     http.setTimeout(10000);
@@ -65,31 +66,16 @@ bool isDeviceRegistered() {
 
 void connectCb() {
   Serial.println("On connecting to Wifi");
-
-  // Ensure device is registered and has a valid auth token before connecting WebSocket
-  Serial.println("=== CHECKING DEVICE REGISTRATION ===");
-
-  if (authTokenGlobal.isEmpty()) {
-    Serial.println("No auth token found, attempting to register device...");
-
-    if (isDeviceRegistered()) {
-      Serial.println("Device registration successful!");
-      Serial.println("New token: " + authTokenGlobal.substring(0, 20) + "...");
+  if (isDeviceRegistered())  {
+    if (otaState == OTA_IN_PROGRESS) {
+        performOTAUpdate();
+    } else if (otaState == OTA_COMPLETE) {
+        markOTAUpdateComplete();
+        ESP.restart();
     } else {
-      Serial.println("ERROR: Device registration failed!");
-      Serial.println("Please ensure the device is registered on the server.");
-      Serial.println("MAC Address: " + WiFi.macAddress());
-      Serial.println("WebSocket connection will be attempted anyway...");
+        websocketSetup(ws_server, ws_port, ws_path);
     }
-  } else {
-    Serial.println("Auth token exists: " + authTokenGlobal.substring(0, 20) + "...");
-  }
-
-  Serial.println("===================================");
-
-  // Immediately setup WebSocket when WiFi connects (like old robust implementation)
-  // Call websocketSetup immediately when WiFi connects (old robust pattern)
-  websocketSetup(ws_server, ws_port, ws_path);
+  } 
 }
 
 /**
@@ -110,7 +96,7 @@ void WIFIMANAGER::logMessage(String msg) {
  */
 void wifiTask(void* param) {
   yield();
-  vTaskDelay(500); // wait a short time until everything is setup before executing the loop forever
+  delay(500); // wait a short time until everything is setup before executing the loop forever
   yield();
   const TickType_t xDelay = 10000 / portTICK_PERIOD_MS;
   WIFIMANAGER * wifimanager = (WIFIMANAGER *) param;
@@ -165,6 +151,7 @@ WIFIMANAGER::WIFIMANAGER(const char * ns) {
   WiFi.onEvent([&](WiFiEvent_t event, WiFiEventInfo_t info) {
     logMessage("[WIFI] onEvent() AP mode started!\n");
     softApRunning = true;
+    deviceState = SOFT_AP;
 #if ESP_ARDUINO_VERSION_MAJOR >= 2
     }, ARDUINO_EVENT_WIFI_AP_START); // arduino-esp32 2.0.0 and later
 #else
@@ -173,6 +160,7 @@ WIFIMANAGER::WIFIMANAGER(const char * ns) {
   WiFi.onEvent([&](WiFiEvent_t event, WiFiEventInfo_t info) {
     logMessage("[WIFI] onEvent() AP mode stopped!\n");
     softApRunning = false;
+    deviceState = IDLE;
 #if ESP_ARDUINO_VERSION_MAJOR >= 2
     }, ARDUINO_EVENT_WIFI_AP_STOP); // arduino-esp32 2.0.0 and later
 #else
@@ -418,7 +406,7 @@ void WIFIMANAGER::loop() {
     }
     logMessage("[WIFI] Running in AP mode but timeout reached. Closing AP!\n");
     stopSoftAP();
-    vTaskDelay(100);
+    delay(100);
   }
 }
 
@@ -488,7 +476,7 @@ bool WIFIMANAGER::tryConnect() {
     auto startTime = millis();
     // wait for connection, fail, or timeout
     while(status != WL_CONNECTED && status != WL_NO_SSID_AVAIL && status != WL_CONNECT_FAILED && (millis() - startTime) <= 10000) {
-        vTaskDelay(10);
+        delay(10);
         status = (wl_status_t)WiFi.waitForConnectResult(5000UL);
     }
     switch(status) {
@@ -639,7 +627,7 @@ void WIFIMANAGER::attachWebServer(WebServer * srv) {
     webServer->send(200, "application/json", "{\"message\":\"Soft AP stopped\"}");
 #endif
     yield();
-    vTaskDelay(250);
+    delay(250);
     runSoftAP();
   });
   
@@ -651,7 +639,7 @@ void WIFIMANAGER::attachWebServer(WebServer * srv) {
     webServer->send(200, "application/json", "{\"message\":\"Soft AP stopped\"}");
 #endif
     yield();
-    vTaskDelay(250); // It's likely that this message won't go trough, but we give it a short time
+    delay(250); // It's likely that this message won't go trough, but we give it a short time
     stopSoftAP();
   });
 
@@ -663,7 +651,7 @@ void WIFIMANAGER::attachWebServer(WebServer * srv) {
     webServer->send(200, "application/json", "{\"message\":\"Terminating current Wifi connection\"}");
 #endif
     yield();
-    vTaskDelay(500); // It's likely that this message won't go trough, but we give it a short time
+    delay(500); // It's likely that this message won't go trough, but we give it a short time
     stopClient();
   });
 
@@ -870,145 +858,42 @@ void WIFIMANAGER::attachUI() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AISHA Device Setup</title>
+    <title>YOUR ELATO 😊</title>
     <style>
         :root {
             --primary-color: #2563eb;
-            --primary-hover: #1d4ed8;
-            --secondary-color: #64748b;
             --bg-color: #f8fafc;
             --card-bg: #ffffff;
             --text-color: #1e293b;
-            --text-secondary: #64748b;
             --border-color: #e2e8f0;
-            --success-color: #059669;
-            --success-bg: #ecfdf5;
-            --error-color: #dc2626;
-            --error-bg: #fef2f2;
-            --warning-color: #d97706;
-            --warning-bg: #fffbeb;
-            --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-            --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-        }
-
-        * {
-            box-sizing: border-box;
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: system-ui, -apple-system, sans-serif;
+            background: var(--bg-color);
             color: var(--text-color);
             margin: 0;
-            padding: 20px;
-            line-height: 1.6;
-            min-height: 100vh;
+            padding: 16px;
+            line-height: 1.5;
         }
 
         .container {
-            max-width: 640px;
+            max-width: 600px;
             margin: 0 auto;
-        }
-
-        .header {
-            text-align: center;
-            margin-bottom: 32px;
-        }
-
-        .logo {
-            background: var(--card-bg);
-            border-radius: 16px;
-            padding: 24px;
-            margin-bottom: 24px;
-            box-shadow: var(--shadow-lg);
-            border: 1px solid var(--border-color);
-        }
-
-        .logo h1 {
-            margin: 0;
-            font-size: 2.5rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, var(--primary-color), #7c3aed);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .logo p {
-            margin: 8px 0 0 0;
-            color: var(--text-secondary);
-            font-size: 1.1rem;
         }
 
         .card {
             background: var(--card-bg);
-            border-radius: 16px;
-            padding: 24px;
-            margin-bottom: 24px;
-            box-shadow: var(--shadow-lg);
-            border: 1px solid var(--border-color);
-            backdrop-filter: blur(10px);
-        }
-
-        .card h2 {
-            margin: 0 0 20px 0;
-            color: var(--text-color);
-            font-size: 1.5rem;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .action-buttons {
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-            margin-bottom: 20px;
-        }
-
-        .btn {
-            background: var(--primary-color);
-            color: white;
-            border: none;
-            padding: 12px 24px;
             border-radius: 8px;
-            cursor: pointer;
-            font-size: 0.95rem;
-            font-weight: 500;
-            transition: all 0.2s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            text-decoration: none;
-            min-height: 44px;
-        }
-
-        .btn:hover {
-            background: var(--primary-hover);
-            transform: translateY(-1px);
-            box-shadow: var(--shadow-md);
-        }
-
-        .btn:active {
-            transform: translateY(0);
-        }
-
-        .btn-secondary {
-            background: var(--bg-color);
-            color: var(--text-color);
+            padding: 16px;
+            margin-bottom: 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
             border: 1px solid var(--border-color);
         }
 
-        .btn-secondary:hover {
-            background: #e2e8f0;
-        }
-
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
+        h1, h2 {
+            margin: 0 0 16px 0;
+            color: var(--text-color);
         }
 
         .network-list {
@@ -1020,92 +905,86 @@ void WIFIMANAGER::attachUI() {
         .network-item {
             display: flex;
             align-items: center;
-            padding: 16px;
+            padding: 12px;
             border-bottom: 1px solid var(--border-color);
             cursor: pointer;
-            transition: all 0.2s ease;
-            border-radius: 8px;
-            margin-bottom: 8px;
+            transition: background-color 0.2s;
         }
 
         .network-item:last-child {
             border-bottom: none;
-            margin-bottom: 0;
         }
 
         .network-item:hover {
-            background: var(--bg-color);
-            transform: translateX(4px);
+            background-color: var(--bg-color);
         }
 
         .network-info {
             flex-grow: 1;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
         }
 
-        .network-details {
-            flex-grow: 1;
+        .network-info div {
+          float: left;
+          width: 70%;
+        }
+
+        .network-info button {
+          float: right;
+          width: 30%;
         }
 
         .ssid {
-            font-weight: 600;
+            font-weight: 500;
             margin-bottom: 4px;
-            color: var(--text-color);
-            font-size: 1rem;
         }
 
         .signal {
             font-size: 0.875rem;
-            color: var(--text-secondary);
-            display: flex;
-            align-items: center;
-            gap: 4px;
+            color: #64748b;
         }
 
-        .btn-small {
-            padding: 8px 16px;
-            font-size: 0.875rem;
-            min-height: 36px;
-        }
-
-        .btn-danger {
-            background: var(--error-color);
+        button {
+            background: var(--primary-color);
             color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: opacity 0.2s;
         }
 
-        .btn-danger:hover {
-            background: #b91c1c;
+        button:hover {
+            opacity: 0.9;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
 
         .status {
-            padding: 16px;
-            border-radius: 12px;
-            margin-bottom: 20px;
+            padding: 8px;
+            border-radius: 4px;
+            margin-bottom: 16px;
             display: none;
-            font-weight: 500;
-            border-left: 4px solid;
         }
 
         .status.error {
-            background: var(--error-bg);
-            color: var(--error-color);
-            border-left-color: var(--error-color);
+            background: #fee2e2;
+            color: #991b1b;
             display: block;
         }
 
         .status.success {
-            background: var(--success-bg);
-            color: var(--success-color);
-            border-left-color: var(--success-color);
+            background: #dcfce7;
+            color: #166534;
             display: block;
         }
 
         .status.info {
-            background: var(--warning-bg);
-            color: var(--warning-color);
-            border-left-color: var(--warning-color);
+            background: #e0f2fe;
+            color: #075985;
             display: block;
         }
 
@@ -1116,198 +995,81 @@ void WIFIMANAGER::attachUI() {
             left: 0;
             width: 100%;
             height: 100%;
-            background: rgba(0, 0, 0, 0.6);
+            background: rgba(0,0,0,0.5);
             align-items: center;
             justify-content: center;
-            z-index: 1000;
-            backdrop-filter: blur(4px);
         }
 
         .modal-content {
             background: var(--card-bg);
-            padding: 32px;
-            border-radius: 16px;
+            padding: 24px;
+            border-radius: 8px;
             width: 90%;
-            max-width: 480px;
-            box-shadow: var(--shadow-lg);
-            border: 1px solid var(--border-color);
-        }
-
-        .modal h2 {
-            margin: 0 0 24px 0;
-            color: var(--text-color);
-            font-size: 1.5rem;
-            font-weight: 600;
-        }
-
-        .form-group {
-            margin-bottom: 20px;
-        }
-
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 500;
-            color: var(--text-color);
+            max-width: 400px;
         }
 
         input {
             width: 100%;
-            padding: 12px 16px;
-            border: 2px solid var(--border-color);
-            border-radius: 8px;
+            padding: 8px;
+            margin: 8px 0 16px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            box-sizing: border-box;
             font-size: 16px;
-            transition: border-color 0.2s ease;
-            background: var(--card-bg);
-        }
-
-        input:focus {
-            outline: none;
-            border-color: var(--primary-color);
-            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
         }
 
         .button-group {
             display: flex;
-            gap: 12px;
+            gap: 8px;
             justify-content: flex-end;
-            margin-top: 24px;
         }
 
-        .empty-state {
-            text-align: center;
-            padding: 40px 20px;
-            color: var(--text-secondary);
+        .button-secondary {
+            background: var(--bg-color);
+            color: var(--text-color);
+            border: 1px solid var(--border-color);
         }
 
-        .empty-state-icon {
-            font-size: 3rem;
-            margin-bottom: 16px;
-            opacity: 0.5;
-        }
-
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 2px solid var(--border-color);
-            border-radius: 50%;
-            border-top-color: var(--primary-color);
-            animation: spin 1s ease-in-out infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        .signal-strength {
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-        }
-
-        .signal-bars {
-            display: flex;
-            gap: 1px;
-            align-items: end;
-        }
-
-        .signal-bar {
-            width: 3px;
-            background: var(--text-secondary);
-            border-radius: 1px;
-        }
-
-        .signal-bar.active {
-            background: var(--success-color);
-        }
-
-        .signal-bar:nth-child(1) { height: 4px; }
-        .signal-bar:nth-child(2) { height: 8px; }
-        .signal-bar:nth-child(3) { height: 12px; }
-        .signal-bar:nth-child(4) { height: 16px; }
-
-        @media (max-width: 640px) {
-            body {
-                padding: 16px;
-            }
-
-            .card {
-                padding: 20px;
-                margin-bottom: 20px;
-            }
-
-            .action-buttons {
-                flex-direction: column;
-            }
-
-            .btn {
-                width: 100%;
-                justify-content: center;
-            }
-
-            .network-info {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 12px;
-            }
-
-            .modal-content {
-                padding: 24px;
-                margin: 20px;
-            }
+        .saved-networks {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border-color);
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <div class="logo">
-                <h1>🤖 AISHA</h1>
-                <p>Thiết bị thông minh của bạn</p>
-            </div>
-        </div>
-
         <div class="card">
+            <h1>YOUR ELATO DEVICE 😊</h1>
             <div id="status"></div>
-            <div class="action-buttons">
-                <button class="btn" onclick="scanNetworks()">
-                    🔍 Quét mạng WiFi
-                </button>
-                <button class="btn btn-secondary" onclick="showConnectModal()">
-                    ➕ Kết nối thủ công
-                </button>
-            </div>
+            <button onclick="scanNetworks()">Scan for Networks</button>
+            <button onclick="showConnectModal()">Manual Connect</button>
         </div>
 
         <div class="card">
-            <h2>💾 Mạng đã lưu</h2>
+            <h2>✅ Saved Networks</h2>
             <div id="savedNetworks" class="network-list"></div>
         </div>
 
         <div class="card">
-            <h2>📶 Mạng khả dụng</h2>
+            <h2>🛜 Available Networks</h2>
             <div id="networkList" class="network-list"></div>
         </div>
     </div>
 
     <div id="connectModal" class="modal">
         <div class="modal-content">
-            <h2>🔗 Kết nối mạng WiFi</h2>
+            <h2>Connect to Network</h2>
             <form id="connectForm" onsubmit="connectToNetwork(event)">
-                <div class="form-group">
-                    <label for="apName">Tên mạng (SSID):</label>
-                    <input type="text" id="apName" required placeholder="Nhập tên mạng WiFi">
-                </div>
-
-                <div class="form-group">
-                    <label for="apPass">Mật khẩu:</label>
-                    <input type="password" id="apPass" required placeholder="Nhập mật khẩu WiFi">
-                </div>
-
+                <label for="apName">Network Name:</label>
+                <input type="text" id="apName" required>
+                
+                <label for="apPass">Password:</label>
+                <input type="password" id="apPass" required>
+                
                 <div class="button-group">
-                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Hủy</button>
-                    <button type="submit" class="btn">Kết nối</button>
+                    <button type="button" class="button-secondary" onclick="closeModal()">Cancel</button>
+                    <button type="submit">Connect</button>
                 </div>
             </form>
         </div>
@@ -1326,70 +1088,51 @@ void WIFIMANAGER::attachUI() {
         async function loadSavedNetworks() {
             try {
                 const response = await fetch(`${API_BASE}/wifi/configlist`);
-                if (!response.ok) throw new Error('Không thể tải danh sách mạng đã lưu');
-
+                if (!response.ok) throw new Error('Failed to fetch saved networks');
+                
                 const savedNetworks = await response.json();
                 displaySavedNetworks(savedNetworks);
             } catch (error) {
-                showStatus('❌ Lỗi tải mạng đã lưu: ' + error.message, 'error');
+                showStatus('Failed to load saved networks: ' + error.message, 'error');
             }
         }
 
         function displaySavedNetworks(networks) {
             const networkList = document.getElementById('savedNetworks');
             const networkArray = Object.values(networks);
-
+            
             if (networkArray.length === 0) {
-                networkList.innerHTML = `
-                    <div class="empty-state">
-                        <div class="empty-state-icon">📱</div>
-                        <p>Chưa có mạng WiFi nào được lưu</p>
-                    </div>
-                `;
+                networkList.innerHTML = '<div class="network-item">No saved networks</div>';
                 return;
             }
 
             networkList.innerHTML = networkArray.map(network => `
                 <div class="network-item">
                     <div class="network-info">
-                        <div class="network-details">
-                            <div class="ssid">🔗 ${network.apName}</div>
-                            <div class="signal">Đã lưu • ${network.apPass ? 'Có mật khẩu' : 'Không có mật khẩu'}</div>
-                        </div>
-                        <button class="btn btn-small btn-danger" onclick="deleteNetwork('${network.id}')">
-                            🗑️ Xóa
-                        </button>
+                        <div class="ssid">${network.apName}</div>
+                        <button onclick="deleteNetwork('${network.id}')">🗑️ Remove</button>
                     </div>
                 </div>
             `).join('');
         }
 
         async function scanNetworks() {
-            const scanBtn = document.querySelector('button[onclick="scanNetworks()"]');
-            const originalText = scanBtn.innerHTML;
-
             try {
-                scanBtn.innerHTML = '<span class="loading"></span> Đang quét...';
-                scanBtn.disabled = true;
-                showStatus('🔍 Đang quét mạng WiFi xung quanh...', 'info');
-
+                showStatus('Scanning for networks...', 'info');
                 const response = await fetch(`${API_BASE}/wifi/scan`);
-                if (!response.ok) throw new Error('Quét mạng thất bại');
-
+                if (!response.ok) throw new Error('Network scan failed');
+                
                 // Wait 5 seconds for the scan to complete
                 await new Promise(resolve => setTimeout(resolve, 5000));
-
-                const scanResponse = await fetch(`${API_BASE}/wifi/scan`);
-                if (!scanResponse.ok) throw new Error('Không thể lấy kết quả quét');
-
+                
+                const scanResponse = await fetch(`${API_BASE}/wifi/scan/results`);
+                if (!scanResponse.ok) throw new Error('Failed to fetch scan results');
+                
                 networks = await scanResponse.json();
                 displayNetworks(networks);
-                showStatus('✅ Đã tìm thấy ' + Object.keys(networks).length + ' mạng WiFi', 'success');
+                showStatus('Networks found', 'success');
             } catch (error) {
-                showStatus('❌ Lỗi: ' + error.message, 'error');
-            } finally {
-                scanBtn.innerHTML = originalText;
-                scanBtn.disabled = false;
+                showStatus(error.message, 'error');
             }
         }
 
@@ -1397,15 +1140,9 @@ void WIFIMANAGER::attachUI() {
             const networkList = document.getElementById('networkList');
             const networkArray = Object.values(networks || {})
               .filter(network => network && network.ssid && network.ssid.length > 0);
-
+            
             if (networkArray.length === 0) {
-                networkList.innerHTML = `
-                    <div class="empty-state">
-                        <div class="empty-state-icon">📡</div>
-                        <p>Không tìm thấy mạng WiFi nào</p>
-                        <button class="btn btn-secondary" onclick="scanNetworks()">Quét lại</button>
-                    </div>
-                `;
+                networkList.innerHTML = '<div class="network-item">No networks found</div>';
                 return;
             }
 
@@ -1416,17 +1153,10 @@ void WIFIMANAGER::attachUI() {
                 .map(network => `
                     <div class="network-item" onclick="showConnectModal('${network.ssid}')">
                         <div class="network-info">
-                            <div class="network-details">
-                                <div class="ssid">
-                                    ${network.encryptionType > 0 ? '🔒' : '🌐'} ${network.ssid}
-                                </div>
-                                <div class="signal">
-                                    <span class="signal-strength">
-                                        ${getSignalBars(network.rssi)}
-                                        ${getSignalStrength(network.rssi)}
-                                    </span>
-                                    • ${network.encryptionType > 0 ? 'Bảo mật' : 'Mở'}
-                                </div>
+                            <div class="ssid">${network.ssid}</div>
+                            <div class="signal">
+                                Signal: ${getSignalStrength(network.rssi)}
+                                ${network.encryptionType > 0 ? '🔒' : ''}
                             </div>
                         </div>
                     </div>
@@ -1434,26 +1164,11 @@ void WIFIMANAGER::attachUI() {
         }
 
         function getSignalStrength(rssi) {
-            if (rssi >= -50) return 'Tuyệt vời';
-            if (rssi >= -60) return 'Rất tốt';
-            if (rssi >= -70) return 'Tốt';
-            if (rssi >= -80) return 'Khá';
-            return 'Yếu';
-        }
-
-        function getSignalBars(rssi) {
-            let bars = 0;
-            if (rssi >= -50) bars = 4;
-            else if (rssi >= -60) bars = 3;
-            else if (rssi >= -70) bars = 2;
-            else if (rssi >= -80) bars = 1;
-
-            let barsHtml = '<span class="signal-bars">';
-            for (let i = 1; i <= 4; i++) {
-                barsHtml += `<span class="signal-bar ${i <= bars ? 'active' : ''}"></span>`;
-            }
-            barsHtml += '</span>';
-            return barsHtml;
+            if (rssi >= -50) return 'Excellent';
+            if (rssi >= -60) return 'Very Good';
+            if (rssi >= -70) return 'Good';
+            if (rssi >= -80) return 'Fair';
+            return 'Poor';
         }
 
         function showConnectModal(apName = '') {
@@ -1468,12 +1183,7 @@ void WIFIMANAGER::attachUI() {
         }
 
         async function deleteNetwork(deleteId) {
-            if (!confirm('Bạn có chắc chắn muốn xóa mạng này?')) {
-                return;
-            }
-
             try {
-                showStatus('🗑️ Đang xóa mạng...', 'info');
                 const response = await fetch(`${API_BASE}/wifi/id`, {
                     method: 'DELETE',
                     headers: {
@@ -1481,13 +1191,13 @@ void WIFIMANAGER::attachUI() {
                     },
                     body: JSON.stringify({ id: deleteId }),
                 });
-
-                if (!response.ok) throw new Error('Không thể xóa mạng');
-
-                showStatus('✅ Đã xóa mạng thành công', 'success');
+                
+                if (!response.ok) throw new Error(JSON.stringify(response));
+                
+                showStatus('Network deleted successfully', 'success');
                 await loadSavedNetworks(); // Refresh the list
             } catch (error) {
-                showStatus('❌ Lỗi khi xóa mạng: ' + error.message, 'error');
+                showStatus('Failed to delete network: ' + error.message, 'error');
             }
         }
 
@@ -1495,14 +1205,9 @@ void WIFIMANAGER::attachUI() {
             event.preventDefault();
             const apName = document.getElementById('apName').value;
             const apPass = document.getElementById('apPass').value;
-            const submitBtn = event.target.querySelector('button[type="submit"]');
-            const originalText = submitBtn.innerHTML;
 
             try {
-                submitBtn.innerHTML = '<span class="loading"></span> Đang kết nối...';
-                submitBtn.disabled = true;
-                showStatus('🔗 Đang kết nối tới mạng ' + apName + '...', 'info');
-
+                showStatus('Connecting to network...', 'info');
                 const response = await fetch(`${API_BASE}/wifi/add`, {
                     method: 'POST',
                     headers: {
@@ -1511,18 +1216,15 @@ void WIFIMANAGER::attachUI() {
                     body: JSON.stringify({ apName, apPass }),
                 });
 
-                if (!response.ok) throw new Error('Kết nối thất bại');
+                if (!response.ok) throw new Error('Connection failed');
 
                 closeModal();
-                showStatus('🎉 Kết nối thành công tới mạng ' + apName + '!', 'success');
-
+                showStatus('Successfully connected!', 'success');
+                
                 // Refresh saved networks list
                 await loadSavedNetworks();
             } catch (error) {
-                showStatus('❌ Lỗi kết nối: ' + error.message, 'error');
-            } finally {
-                submitBtn.innerHTML = originalText;
-                submitBtn.disabled = false;
+                showStatus(error.message, 'error');
             }
         }
 
