@@ -7,7 +7,7 @@
 // Energy thresholds (may need tuning based on your microphone sensitivity)
 // Higher values = less sensitive (fewer false positives)
 // Lower values = more sensitive (may pick up background noise)
-#define VAD_SPEECH_THRESHOLD    1500.0f    // RMS energy threshold for speech start
+#define VAD_SPEECH_THRESHOLD    1450.0f    // RMS energy threshold for speech start
 #define VAD_SILENCE_THRESHOLD   1400.0f    // RMS energy threshold for speech end (hysteresis)
 
 // Timing parameters (in frames, where each frame = 20ms)

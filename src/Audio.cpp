@@ -18,6 +18,8 @@
  #include "SPIFFS.h"
  #include <stdlib.h> // Required for rand() and srand()
  #include <time.h>   // Required for time()
+ #include <algorithm> // Required for min() function
+ #include <esp_task_wdt.h> // Required for watchdog
 
  // For camera:
  #include "base64.h"
@@ -32,6 +34,9 @@
  TaskHandle_t speakerTaskHandle = NULL;
  TaskHandle_t micTaskHandle = NULL;
  TaskHandle_t networkTaskHandle = NULL;
+
+ // Event groups for better task coordination
+ EventGroupHandle_t audioEventGroup = NULL;
  
  // -------------- TIMING --------------
  bool scheduleListeningRestart = false;
@@ -274,6 +279,8 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
 
    opusDecoder.setOutput(bufferPrint);
 
+   //webSocket.enableHeartbeat(10000, 4000, 2); // 10s ping, 4s timeout, 2 retries
+
    Serial.println("Transitioned to speaking mode");
  }
  
@@ -307,6 +314,8 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    Serial.println("Transitioned to listening mode");
 
    deviceState = LISTENING;
+
+   //webSocket.disableHeartbeat();
 
    // Reset VAD when transitioning to listening
    vad.reset();
@@ -387,29 +396,71 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    esp_camera_fb_return(fb);
 
    Serial.printf("Step 6: Base64 encoding complete - %d characters\n", strlen(b64buf));
+   Serial.printf("Free heap before chunking: %d bytes\n", ESP.getFreeHeap());
 
-   StaticJsonDocument<256> doc;
-   doc["type"] = "image";
-   doc["mime"] = "image/jpeg";
-   doc["data"] = b64buf;
+   // Calculate chunking parameters
+   size_t base64Length = strlen(b64buf);
+   size_t totalChunks = (base64Length + IMAGE_CHUNK_SIZE - 1) / IMAGE_CHUNK_SIZE; // Ceiling division
 
-   String json;
-   serializeJson(doc, json);
-   free(b64buf);
+   Serial.printf("Step 7: Chunking image - %d bytes into %d chunks of %d bytes each\n",
+                 base64Length, totalChunks, IMAGE_CHUNK_SIZE);
 
-   Serial.printf("Step 7: JSON prepared - %d bytes\n", json.length());
+   // Send chunks
+   bool allChunksSent = true;
+   for (size_t chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+     size_t chunkStart = chunkIndex * IMAGE_CHUNK_SIZE;
+     size_t chunkSize = min(IMAGE_CHUNK_SIZE, base64Length - chunkStart);
 
-   // Send to server
-   Serial.println("Step 8: Sending via WebSocket...");
+     // Create chunk message
+     StaticJsonDocument<512> chunkDoc;
+     chunkDoc["type"] = "image_chunk";
+     chunkDoc["chunk_index"] = chunkIndex;
+     chunkDoc["total_chunks"] = totalChunks;
+
+     // Extract chunk data
+     char chunkData[IMAGE_CHUNK_SIZE + 1];
+     strncpy(chunkData, b64buf + chunkStart, chunkSize);
+     chunkData[chunkSize] = '\0';
+     chunkDoc["data"] = chunkData;
+
+     String chunkJson;
+     serializeJson(chunkDoc, chunkJson);
+
+     // Send chunk
    if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-     webSocket.sendTXT(json);
+       webSocket.sendTXT(chunkJson);
      xSemaphoreGive(wsMutex);
-     Serial.println("Step 9: Photo sent successfully!");
+       Serial.printf("Sent chunk %d/%d (%d bytes)\n", chunkIndex + 1, totalChunks, chunkSize);
+       delay(10); // Small delay between chunks to prevent overwhelming
    } else {
-     Serial.println("ERROR: Failed to acquire WebSocket mutex!");
+       Serial.printf("ERROR: Failed to acquire WebSocket mutex for chunk %d!\n", chunkIndex);
+       allChunksSent = false;
+       break;
+     }
    }
 
-   Serial.printf("Photo capture complete => %u bytes of JSON sent\n", json.length());
+   // Send completion message
+   if (allChunksSent) {
+     StaticJsonDocument<256> completeDoc;
+     completeDoc["type"] = "image_complete";
+     completeDoc["total_chunks"] = totalChunks;
+     completeDoc["mime"] = "image/jpeg";
+
+     String completeJson;
+     serializeJson(completeDoc, completeJson);
+
+     if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+       webSocket.sendTXT(completeJson);
+       xSemaphoreGive(wsMutex);
+       Serial.println("Step 8: Image streaming complete!");
+     } else {
+       Serial.println("ERROR: Failed to send completion message!");
+     }
+   }
+
+   free(b64buf);
+
+   Serial.printf("Photo capture complete => %d chunks sent\n", totalChunks);
 
    sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
    delay(1000);
@@ -493,7 +544,7 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
              transitionToSpeakingTimestamp > 0 &&
              (millis() - transitionToSpeakingTimestamp > 1000)) { // Removed buffer check
  
-             int randomSoundIndex = rand() % 10 + 1;
+             int randomSoundIndex = rand() % 4 + 1;
              snprintf(randomSoundPath, sizeof(randomSoundPath), "/processing_%d.mp3", randomSoundIndex);
              Serial.printf("Attempting to start processing sound: %s...\n", randomSoundPath);
  
@@ -625,6 +676,8 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
           vTaskDelay(pdMS_TO_TICKS(1));
      }
  
+     esp_task_wdt_reset(); // Reset watchdog
+
    } // End while(1)
  }
  
@@ -689,6 +742,11 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
        lastStackCheck = millis();
      }
 
+     // Check to see if a transition to listening mode is scheduled.
+     if (scheduleListeningRestart && millis() >= scheduledTime) {
+       transitionToListening();
+     }
+
      if (deviceState == LISTENING && webSocket.isConnected()) {
        // Simple VAD processing for speech detection
        size_t bytesRead = i2sInput.readBytes(vadSampleBuffer, MIC_COPY_SIZE);
@@ -745,6 +803,9 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
      } else {
        vTaskDelay(10);
      }
+
+     // Always reset watchdog regardless of device state to prevent timeout
+     esp_task_wdt_reset();
    }
  }
  
@@ -755,6 +816,7 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    switch (type) {
      case WStype_DISCONNECTED:
        Serial.println("[WSc] Disconnected");
+       playSoundFile("/WS_restart.mp3");
        deviceState = IDLE;
        break;
 
@@ -875,42 +937,62 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
  // -----------------------------------------------------------------------------
  // Simple robust websocketSetup like the old implementation
  void websocketSetup(String server_domain, int port, String path) {
+   Serial.printf("=== WEBSOCKET SETUP ===\n");
+   Serial.printf("Server: %s:%d%s\n", server_domain.c_str(), port, path.c_str());
+
    String headers = "Authorization: Bearer " + String(authTokenGlobal);
 
-   xSemaphoreTake(wsMutex, portMAX_DELAY);
+   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+     Serial.println("ERROR: Failed to acquire WebSocket mutex for setup");
+     return;
+   }
 
    webSocket.setExtraHeaders(headers.c_str());
    webSocket.onEvent(webSocketEvent);
    webSocket.setReconnectInterval(1000);
+
+   // Disable heartbeat to prevent connection hanging issues
    webSocket.disableHeartbeat();
 
-   // webSocket.enableHeartbeat(30000, 15000, 3); // 30s ping interval, 15s timeout, 3 retries
-
    #ifdef DEV_MODE
+   Serial.println("DEV_MODE: Using non-SSL WebSocket connection");
    webSocket.begin(server_domain.c_str(), port, path.c_str());
    #else
+   Serial.println("PROD_MODE: Using SSL WebSocket connection");
    webSocket.beginSslWithCA(server_domain.c_str(), port, path.c_str(), CA_cert);
    #endif
 
    xSemaphoreGive(wsMutex);
+   Serial.println("WebSocket setup completed");
  }
  
- // Simple robust networkTask like the old implementation
+ // Robust networkTask with watchdog protection
  void networkTask(void *parameter) {
    Serial.println("Network task started");
 
-   while (1) {
-     xSemaphoreTake(wsMutex, portMAX_DELAY);
+   unsigned long lastWatchdogReset = 0;
+   const unsigned long WATCHDOG_RESET_INTERVAL = 1000; // Reset every 1 second minimum
 
-     // Check to see if a transition to listening mode is scheduled.
-     if (scheduleListeningRestart && millis() >= scheduledTime) {
-       transitionToListening();
+   while (1) {
+     // Always reset watchdog first, regardless of WebSocket state
+     unsigned long currentTime = millis();
+     if (currentTime - lastWatchdogReset >= WATCHDOG_RESET_INTERVAL) {
+       esp_task_wdt_reset();
+       lastWatchdogReset = currentTime;
      }
 
-     webSocket.loop();
-     xSemaphoreGive(wsMutex);
+     // Try to process WebSocket with timeout protection
+     if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+       // Call webSocket.loop() but ensure we don't block too long
+       webSocket.loop();
+       xSemaphoreGive(wsMutex);
+     } else {
+       // If we can't get mutex, still continue and reset watchdog
+       Serial.println("Network task: WebSocket mutex busy, continuing...");
+     }
 
-     vTaskDelay(1);
+     // Always delay to prevent tight loop and allow other tasks to run
+     vTaskDelay(pdMS_TO_TICKS(50));
    }
  }
  

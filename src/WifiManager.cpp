@@ -11,6 +11,9 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <Config.h>
+#include <esp_wifi.h> // add for power save and rate control
+#include "esp_wifi_types.h"
+#include "esp_private/wifi.h"
 
 bool isDeviceRegistered() {
   if (!authTokenGlobal.isEmpty()) {
@@ -87,6 +90,9 @@ void connectCb() {
 
   Serial.println("===================================");
 
+  // Play connection success sound
+  playSoundFile("/connecting.mp3");
+
   // Immediately setup WebSocket when WiFi connects (like old robust implementation)
   // Call websocketSetup immediately when WiFi connects (old robust pattern)
   websocketSetup(ws_server, ws_port, ws_path);
@@ -135,6 +141,7 @@ void WIFIMANAGER::startBackgroundTask(String softApName, String softApPass) {
   if (softApPass.length()) this->softApPass = softApPass;
 
   WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE); // keep RF awake - eliminates 400-3000ms jitter
   loadFromNVS();
   tryConnect();
 
@@ -164,6 +171,7 @@ WIFIMANAGER::WIFIMANAGER(const char * ns) {
   // AP on/off
   WiFi.onEvent([&](WiFiEvent_t event, WiFiEventInfo_t info) {
     logMessage("[WIFI] onEvent() AP mode started!\n");
+    playSoundFile("/No_wifi_startAP.mp3");
     softApRunning = true;
 #if ESP_ARDUINO_VERSION_MAJOR >= 2
     }, ARDUINO_EVENT_WIFI_AP_START); // arduino-esp32 2.0.0 and later
@@ -446,6 +454,7 @@ bool WIFIMANAGER::tryConnect() {
     choosenAp = getApEntry();
   } else {
     WiFi.mode(WIFI_STA);
+    esp_wifi_set_ps(WIFI_PS_NONE); // keep RF awake during scanning
     int8_t scanResult = WiFi.scanNetworks(false, true);
     if(scanResult <= 0) {
       logMessage("[WIFI] Unable to find WIFI networks in range to this device!\n");
@@ -483,6 +492,10 @@ bool WIFIMANAGER::tryConnect() {
     );
 
     WiFi.begin(apList[choosenAp].apName.c_str(), apList[choosenAp].apPass.c_str());
+
+    // Set max TX power and robust rate for fewer lost frames near edge of coverage
+    WiFi.setTxPower(WIFI_POWER_19_5dBm); // max legal power in most regions
+    esp_wifi_internal_set_fix_rate(WIFI_IF_STA, true, WIFI_PHY_RATE_MCS0_SGI); // legacy 6 Mbps, robust
     wl_status_t status = (wl_status_t)WiFi.waitForConnectResult(5000UL);
 
     auto startTime = millis();

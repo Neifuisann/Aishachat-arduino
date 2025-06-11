@@ -1,5 +1,7 @@
 #include "Config.h"
 #include <nvs_flash.h>
+#include <esp_heap_caps.h>
+#include "SPIFFS.h"
 
 // ! define preferences
 Preferences preferences;
@@ -26,11 +28,11 @@ bool factory_reset_status = false;
  */
 
 #ifdef DEV_MODE
-const char *ws_server = "192.168.1.101";
+const char *ws_server = "192.168.1.101";  // Your computer's IP address
 const uint16_t ws_port = 8000;
 const char *ws_path = "/";
-// Backend server details 
-const char *backend_server = "192.168.1.101";
+// Backend server details
+const char *backend_server = "192.168.1.101";  // Your computer's IP address
 const uint16_t backend_port = 3000;
 
 #else
@@ -47,8 +49,51 @@ const uint16_t backend_port = 3000;
 String authTokenGlobal;
 DeviceState deviceState = IDLE;
 
+// Atomic device state management
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+
+void setDeviceState(DeviceState newState) {
+    portENTER_CRITICAL(&stateMux);
+    deviceState = newState;
+    portEXIT_CRITICAL(&stateMux);
+}
+
+DeviceState getDeviceState() {
+    DeviceState state;
+    portENTER_CRITICAL(&stateMux);
+    state = deviceState;
+    portEXIT_CRITICAL(&stateMux);
+    return state;
+}
+
+// OTA-safe heap management functions
+bool checkHeapSafety() {
+    return heap_caps_get_free_size(MALLOC_CAP_8BIT) > HIGH_WATERLINE;
+}
+
+File safeOpenSPIFFS(const char* path, const char* mode) {
+    if (!checkHeapSafety()) {
+        Serial.printf("HEAP WARNING: Insufficient memory (%d bytes) to safely open %s\n",
+                     heap_caps_get_free_size(MALLOC_CAP_8BIT), path);
+        return File();
+    }
+    return SPIFFS.open(path, mode);
+}
+
+void* safeMalloc(size_t size) {
+    if (!checkHeapSafety()) {
+        Serial.printf("HEAP WARNING: Insufficient memory (%d bytes) to safely allocate %d bytes\n",
+                     heap_caps_get_free_size(MALLOC_CAP_8BIT), size);
+        return nullptr;
+    }
+    return malloc(size);
+}
+
 // ─── AUDIO SAMPLE RATE ───────────────────────────────────────────
-const uint32_t SAMPLE_RATE = 16000;    
+const uint32_t SAMPLE_RATE = 16000;
+
+// ─── IMAGE STREAMING CONFIGURATION ───────────────────────────────
+const size_t IMAGE_CHUNK_SIZE = 8192; // 8KB chunks for image streaming
 
 // ----------------- Pin Definitions -----------------
 #ifdef USE_NORMAL_ESP32

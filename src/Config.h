@@ -8,6 +8,8 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <WebSocketsClient.h>
+#include "FS.h"
+#include "SPIFFS.h"
 
 extern Preferences preferences;
 extern bool factory_reset_status;
@@ -26,6 +28,17 @@ enum DeviceState
 };
 
 extern DeviceState deviceState;
+
+// Atomic device state management
+extern portMUX_TYPE stateMux;
+void setDeviceState(DeviceState newState);
+DeviceState getDeviceState();
+
+// OTA-safe heap management
+#define HIGH_WATERLINE (50 * 1024)  // 50KB minimum free heap
+bool checkHeapSafety();
+File safeOpenSPIFFS(const char* path, const char* mode);
+void* safeMalloc(size_t size);
 
 // WiFi credentials
 extern const char *EAP_IDENTITY;
@@ -50,8 +63,11 @@ extern const uint16_t backend_port;
 // I2S and Audio parameters
 extern const uint32_t SAMPLE_RATE;
 
+// Image Streaming Configuration
+extern const size_t IMAGE_CHUNK_SIZE;
+
 // ---------- Development ------------
-// #define DEV_MODE
+#define DEV_MODE
 
 // ─── HIGH-LEVEL SWITCHES ─────────────────────────────────────────
 #define TTP_GPIO_WAKE            // we have a capacitive key, not a push-button

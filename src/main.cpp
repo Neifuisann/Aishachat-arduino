@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <driver/rtc_io.h>
+#include <esp_task_wdt.h>
+#include <freertos/event_groups.h>
 #include "Config.h"
 #include "SPIFFS.h"
 #include "WifiManager.h"
@@ -90,15 +92,15 @@ static void init_camera_once()
   cfg.pin_pclk = PCLK_GPIO_NUM;
   cfg.pin_vsync = VSYNC_GPIO_NUM;
   cfg.pin_href  = HREF_GPIO_NUM;
-  cfg.pin_sscb_sda = SIOD_GPIO_NUM;
-  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_sccb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sccb_scl = SIOC_GPIO_NUM;
   cfg.pin_pwdn  = PWDN_GPIO_NUM;
   cfg.pin_reset = RESET_GPIO_NUM;
   cfg.xclk_freq_hz = 20000000;
   cfg.grab_mode = CAMERA_GRAB_LATEST;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size = FRAMESIZE_VGA;     // 1024×768 = good compromise 
-  cfg.jpeg_quality = 10;              // 0–63 (lower = better quality)
+  cfg.frame_size = FRAMESIZE_XGA;     // 1024×768 = good compromise 
+  cfg.jpeg_quality = 25;              // 0–63 (lower = better quality)
   cfg.fb_location = CAMERA_FB_IN_PSRAM;
   cfg.fb_count = 2;
 
@@ -109,6 +111,7 @@ static void init_camera_once()
     Serial.println("Camera init failed - vision disabled");
   }
 
+  // Optimized sensor settings
   sensor_t *s = esp_camera_sensor_get();
   s->set_hmirror(s, 1);
   s->set_saturation(s, 4);
@@ -133,6 +136,14 @@ void setupDeviceMetadata() {
     }
     Serial.println("mp3Mutex created successfully");
 
+    // Initialize event groups for task coordination
+    audioEventGroup = xEventGroupCreate();
+    if (audioEventGroup == NULL) {
+        Serial.println("FATAL: Failed to create audioEventGroup! System cannot continue.");
+        while(true) { delay(1000); } // Halt system
+    }
+    Serial.println("audioEventGroup created successfully");
+
     // factoryResetDevice(); // Call this if needed before state checks
 
     getAuthTokenFromNVS();
@@ -146,6 +157,8 @@ void setup()
 {
     Serial.begin(115200);
     vTaskDelay(500);
+
+    setCpuFrequencyMhz(240);
 
     // SETUP
     setupDeviceMetadata();
@@ -184,7 +197,7 @@ void setup()
         4096,              // Stack size
         NULL,              // Parameters
         3,                 // Priority
-        NULL,              // Handle
+        &speakerTaskHandle,// Handle
         1                  // Core 1 (application core)
     );
 
@@ -196,11 +209,18 @@ void setup()
         8192,             // Stack size
         NULL,              // Parameters
         4,                 // Priority
-        NULL,              // Handle
+        &micTaskHandle,    // Handle
         1                  // Core 1 (application core)
     );
 
     Serial.printf("Free heap after microphone task: %d bytes\n", ESP.getFreeHeap());
+
+    // Initialize watchdogs for robust task monitoring
+    esp_task_wdt_init(6, true);     // 6s system WDT
+    esp_task_wdt_add(networkTaskHandle);
+    esp_task_wdt_add(micTaskHandle);
+    esp_task_wdt_add(speakerTaskHandle);
+    Serial.println("Watchdogs initialized for all tasks");
 
     // WIFI - Setup AFTER tasks are created (like old implementation)
     // This ensures networkTask is running when connectCb() is called

@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/event_groups.h>
 #include "Print.h"
 #include "Config.h"
 #include "AudioTools.h"
@@ -25,6 +26,14 @@ extern WebSocketsClient webSocket;
 extern TaskHandle_t speakerTaskHandle;
 extern TaskHandle_t micTaskHandle;
 extern TaskHandle_t networkTaskHandle;
+
+// Event groups for better task coordination (replaces boolean flags)
+extern EventGroupHandle_t audioEventGroup;
+#define AUDIO_EVENT_PLAYING_PROCESSING_SOUND  (1 << 0)
+#define AUDIO_EVENT_REAL_AUDIO_ARRIVED        (1 << 1)
+#define AUDIO_EVENT_PROCESSING_SOUND_FINISHED (1 << 2)
+#define AUDIO_EVENT_PLAYING_LIMIT_SOUND       (1 << 3)
+#define AUDIO_EVENT_VAD_SHOULD_STREAM         (1 << 4)
 
 extern bool scheduleListeningRestart;
 extern unsigned long scheduledTime;
@@ -96,6 +105,9 @@ void micTask(void *parameter);
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
 void websocketSetup(String server_domain, int port, String path);
 void networkTask(void *parameter);
+
+// Sound file playback
+void playSoundFile(const char* filename);
 
 // -------------- Camera/Vision --------------
 void transitionToTakingPhoto();           // Switch deviceState, capture photo
