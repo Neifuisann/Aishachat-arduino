@@ -981,12 +981,14 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
        lastWatchdogReset = currentTime;
      }
 
-     // Try to process WebSocket with timeout protection
+     // networkTask() — extra WDT resets around a possibly blocking call
      if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-       // Call webSocket.loop() but ensure we don't block too long
-       webSocket.loop();
+       esp_task_wdt_reset();      // <-- before entering webSocket.loop()
+       webSocket.loop();          // may block
+       esp_task_wdt_reset();      // <-- immediately after
        xSemaphoreGive(wsMutex);
-     } else {
+     }
+     else {
        // If we can't get mutex, still continue and reset watchdog
        Serial.println("Network task: WebSocket mutex busy, continuing...");
      }

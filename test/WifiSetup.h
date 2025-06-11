@@ -31,6 +31,7 @@ AudioPlayer       player(source, i2s, decoder);
 bool isDeviceRegistered(AsyncWebServerRequest *request) {
     HTTPClient http;
     WiFiClientSecure client;
+    client.setTimeout(1500);
     client.setCACert(Vercel_CA_cert);
 
     #ifdef DEV_MODE

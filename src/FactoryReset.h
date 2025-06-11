@@ -5,6 +5,7 @@
 void setResetComplete() {
     HTTPClient http;
     WiFiClientSecure client;
+    client.setTimeout(1500);
     client.setCACert(Vercel_CA_cert);  // Using the existing server certificate
     
     // Construct JSON payload
