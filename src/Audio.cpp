@@ -126,9 +126,9 @@ StreamCopy pitchCopier(volumePitch, queue);
        return 0;
      }
 
-     if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+     if (xSemaphoreTakeRecursive(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
        webSocket.sendBIN(&b, 1);
-       xSemaphoreGive(wsMutex);
+       xSemaphoreGiveRecursive(wsMutex);
      } else {
        Serial.println("WARNING: Failed to acquire wsMutex in ADPCMWebsocketStream::write(byte)");
        return 0;
@@ -147,9 +147,9 @@ StreamCopy pitchCopier(volumePitch, queue);
        return 0;
      }
 
-     if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+     if (xSemaphoreTakeRecursive(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
        webSocket.sendBIN(buffer, size);
-       xSemaphoreGive(wsMutex);
+       xSemaphoreGiveRecursive(wsMutex);
      } else {
        Serial.println("WARNING: Failed to acquire wsMutex in ADPCMWebsocketStream::write(buffer)");
        return 0;
@@ -216,9 +216,9 @@ StreamCopy pitchCopier(volumePitch, queue);
    while (bytesRemaining > 0) {
      size_t chunkSize = (bytesRemaining > PCM_CHUNK_SIZE) ? PCM_CHUNK_SIZE : bytesRemaining;
 
-     if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+     if (xSemaphoreTakeRecursive(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
        webSocket.sendBIN(pcmBytes + offset, chunkSize);
-       xSemaphoreGive(wsMutex);
+       xSemaphoreGiveRecursive(wsMutex);
      }
 
      offset += chunkSize;
@@ -348,9 +348,15 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    Serial.println("=== PHOTO CAPTURE DEBUG ===");
    Serial.println("Step 1: Preparing camera...");
 
+   // Disable watchdog for photo transmission to prevent timeout
+   esp_task_wdt_delete(NULL);
+   Serial.println("Watchdog disabled for photo transmission");
+
    sensor_t* sensor = esp_camera_sensor_get();
    if (!sensor) {
      Serial.println("ERROR: Camera sensor not available!");
+     // Re-enable watchdog before returning
+     esp_task_wdt_add(NULL);
      return;
    }
 
@@ -368,6 +374,8 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    if (!fb) {
      Serial.println("ERROR: Camera capture failed! fb is NULL");
      sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
+     // Re-enable watchdog before returning
+     esp_task_wdt_add(NULL);
      return;
    }
 
@@ -375,6 +383,8 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
      Serial.println("ERROR: Camera captured empty image!");
      esp_camera_fb_return(fb);
      sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
+     // Re-enable watchdog before returning
+     esp_task_wdt_add(NULL);
      return;
    }
 
@@ -388,6 +398,8 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
      Serial.println("ERROR: Failed to allocate memory for base64 encoding!");
      esp_camera_fb_return(fb);
      sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
+     // Re-enable watchdog before returning
+     esp_task_wdt_add(NULL);
      return;
    }
 
@@ -404,6 +416,12 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
 
    Serial.printf("Step 7: Chunking image - %d bytes into %d chunks of %d bytes each\n",
                  base64Length, totalChunks, IMAGE_CHUNK_SIZE);
+
+   // Pause audio streaming during photo transmission to avoid WebSocket mutex contention
+   bool wasStreaming = vadShouldStream;
+   vadShouldStream = false;
+   Serial.println("Paused audio streaming for photo transmission");
+   vTaskDelay(pdMS_TO_TICKS(50)); // Allow current audio operations to complete
 
    // Send chunks
    bool allChunksSent = true;
@@ -426,10 +444,11 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
      String chunkJson;
      serializeJson(chunkDoc, chunkJson);
 
-     // Send chunk
-   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+     // Send chunk with increased timeout
+     Serial.printf("Attempting to send chunk %d/%d...\n", chunkIndex + 1, totalChunks);
+   if (xSemaphoreTakeRecursive(wsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
        webSocket.sendTXT(chunkJson);
-     xSemaphoreGive(wsMutex);
+     xSemaphoreGiveRecursive(wsMutex);
        Serial.printf("Sent chunk %d/%d (%d bytes)\n", chunkIndex + 1, totalChunks, chunkSize);
        delay(10); // Small delay between chunks to prevent overwhelming
    } else {
@@ -449,9 +468,10 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
      String completeJson;
      serializeJson(completeDoc, completeJson);
 
-     if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+     Serial.println("Attempting to send completion message...");
+     if (xSemaphoreTakeRecursive(wsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
        webSocket.sendTXT(completeJson);
-       xSemaphoreGive(wsMutex);
+       xSemaphoreGiveRecursive(wsMutex);
        Serial.println("Step 8: Image streaming complete!");
      } else {
        Serial.println("ERROR: Failed to send completion message!");
@@ -460,10 +480,19 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
 
    free(b64buf);
 
+   // Restore audio streaming after photo transmission
+   vadShouldStream = wasStreaming;
+   Serial.println("Restored audio streaming after photo transmission");
+
    Serial.printf("Photo capture complete => %d chunks sent\n", totalChunks);
 
    sensor->set_reg(sensor, 0x3008, 0xFF, 0x42); // return to standby
    delay(1000);
+
+   // Re-enable watchdog after photo transmission
+   esp_task_wdt_add(NULL);
+   Serial.println("Watchdog re-enabled after photo transmission");
+
    Serial.println("=== PHOTO CAPTURE COMPLETE ===");
  }
  
@@ -942,7 +971,7 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
 
    String headers = "Authorization: Bearer " + String(authTokenGlobal);
 
-   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+   if (xSemaphoreTakeRecursive(wsMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
      Serial.println("ERROR: Failed to acquire WebSocket mutex for setup");
      return;
    }
@@ -962,7 +991,7 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
    webSocket.beginSslWithCA(server_domain.c_str(), port, path.c_str(), CA_cert);
    #endif
 
-   xSemaphoreGive(wsMutex);
+   xSemaphoreGiveRecursive(wsMutex);
    Serial.println("WebSocket setup completed");
  }
  
@@ -982,11 +1011,11 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
      }
 
      // networkTask() — extra WDT resets around a possibly blocking call
-     if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+     if (xSemaphoreTakeRecursive(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
        esp_task_wdt_reset();      // <-- before entering webSocket.loop()
        webSocket.loop();          // may block
        esp_task_wdt_reset();      // <-- immediately after
-       xSemaphoreGive(wsMutex);
+       xSemaphoreGiveRecursive(wsMutex);
      }
      else {
        // If we can't get mutex, still continue and reset watchdog
@@ -994,7 +1023,8 @@ static bool highPassEnabled = true;  // Default high-pass filter enabled
      }
 
      // Always delay to prevent tight loop and allow other tasks to run
-     vTaskDelay(pdMS_TO_TICKS(50));
+     // Slightly longer delay during photo transmission to reduce mutex contention
+     vTaskDelay(pdMS_TO_TICKS(deviceState == TAKING_PHOTO ? 5 : 1));
    }
  }
  

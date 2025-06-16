@@ -6,6 +6,7 @@
 #include "SPIFFS.h"
 #include "WifiManager.h"
 #include "FactoryReset.h"
+#include "ESP32_OV5640_AF.h"
 #include "Audio.h"
 
 #include "esp_camera.h"              
@@ -14,6 +15,7 @@
 
 // #define WEBSOCKETS_DEBUG_LEVEL WEBSOCKETS_LEVEL_ALL  
 
+OV5640 ov5640;
 AsyncWebServer webServer(80);
 WIFIMANAGER WifiManager;
 esp_err_t getErr = ESP_OK;
@@ -99,8 +101,8 @@ static void init_camera_once()
   cfg.xclk_freq_hz = 20000000;
   cfg.grab_mode = CAMERA_GRAB_LATEST;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size = FRAMESIZE_XGA;     // 1024×768 = good compromise 
-  cfg.jpeg_quality = 25;              // 0–63 (lower = better quality)
+  cfg.frame_size = FRAMESIZE_HD;     // 1024×768 = good compromise 
+  cfg.jpeg_quality = 20;              // 0–63 (lower = better quality)
   cfg.fb_location = CAMERA_FB_IN_PSRAM;
   cfg.fb_count = 2;
 
@@ -113,8 +115,32 @@ static void init_camera_once()
 
   // Optimized sensor settings
   sensor_t *s = esp_camera_sensor_get();
-  s->set_hmirror(s, 1);
-  s->set_saturation(s, 4);
+  s->set_brightness(s, 0); // -2 to 2
+  s->set_contrast(s, 0); // -2 to 2
+  s->set_saturation(s, 4); // -2 to 2
+  s->set_special_effect(s, 0); // 0 to 6 (0 - No Effect, 1 - Negative, 2 - Grayscale, 3 - Red Tint, 4 - Green Tint, 5 - Blue Tint, 6 - Sepia)
+  s->set_whitebal(s, 1); // 0 = disable , 1 = enable
+  //s->set_awb_gain(s, 1); // 0 = disable , 1 = enable
+  s->set_wb_mode(s, 0); // 0 to 4 - if awb_gain enabled (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
+  s->set_bpc(s, 1); // 0 = disable , 1 = enable
+  s->set_wpc(s, 1); // 0 = disable , 1 = enable
+  s->set_raw_gma(s, 1); // 0 = disable , 1 = enable (makes much lighter and noisy)
+  s->set_lenc(s, 1); // 0 = disable , 1 = enable
+  s->set_hmirror(s, 0); // 0 = disable , 1 = enable
+  s->set_vflip(s, 1); // 0 = disable , 1 = enable
+  s->set_dcw(s, 0); // 0 = disable , 1 = enable
+  s->set_colorbar(s, 0); // 0 = disable , 1 = enable
+
+  ov5640.start(s);
+  if (ov5640.focusInit() == 0) 
+  {
+    Serial.println("OV5640 Focus Init Successful!");
+  }
+
+  if (ov5640.autoFocusMode() == 0) 
+  {
+    Serial.println("OV5640 Auto Focus Successful!");
+  }
 
   s->set_reg(s, 0x3008, 0xFF, 0x42);   //camera to standby
   delay(1000);
@@ -122,7 +148,8 @@ static void init_camera_once()
 
 void setupDeviceMetadata() {
     // Initialize mutexes early, before tasks start - CRITICAL for thread safety
-    wsMutex = xSemaphoreCreateMutex();
+    wsMutex = xSemaphoreCreateRecursiveMutex();
+    
     if (wsMutex == NULL) {
         Serial.println("FATAL: Failed to create wsMutex! System cannot continue.");
         while(true) { delay(1000); } // Halt system
