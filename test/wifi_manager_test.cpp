@@ -70,7 +70,7 @@ void setup()
     // audio.connecttohost("www.surfmusic.de/m3u/100-5-das-hitradio,4529.m3u");
     // audio.connecttohost("stream.1a-webradio.de/deutsch/mp3-128/vtuner-1a");
     // audio.connecttohost("www.antenne.de/webradio/antenne.m3u");
-    audio.connecttohost("0n-80s.radionetz.de:8000/0n-70s.mp3");
+    audio.connecttohost("0n-80s.radionetz.de:1234/0n-70s.mp3");
 }
 
 void loop()

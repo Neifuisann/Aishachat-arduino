@@ -17,7 +17,7 @@ bool factory_reset_status = false;
  * 3. Without `DEV_MODE` defined, the firmware will use your production servers
  *
  * Development Mode (find your local IP address using ifconfig):
- *   - WebSocket: Your local IP (e.g., 192.168.1.100:8000)
+ *   - WebSocket: Your local IP (e.g., 192.168.1.100:1234)
  *   - Backend: Your local IP (e.g., 192.168.1.100:3000)
  *   - No SSL certificates required
  *
@@ -29,7 +29,7 @@ bool factory_reset_status = false;
 
 #ifdef DEV_MODE
 const char *ws_server = "192.168.1.101";  // Your computer's IP address
-const uint16_t ws_port = 8000;
+const uint16_t ws_port = 1234;
 const char *ws_path = "/";
 // Backend server details
 const char *backend_server = "192.168.1.101";  // Your computer's IP address
@@ -37,11 +37,11 @@ const uint16_t backend_port = 3000;
 
 #else
 // PROD
-const char *ws_server = "neichat.deno.dev";
+const char *ws_server = "aishachat.deno.dev";
 const uint16_t ws_port = 443;
 const char *ws_path = "/";
 // Backend server details 
-const char *backend_server = "neichat.vercel.app";
+const char *backend_server = "aishachat.vercel.app";
 const uint16_t backend_port = 3000;
 
 #endif

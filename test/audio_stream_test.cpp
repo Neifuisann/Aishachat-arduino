@@ -37,7 +37,7 @@ void setup() {
 //  audio.connecttohost("https://stream.srg-ssr.ch/rsp/aacp_48.asx");                                   // asx
 //  audio.connecttohost("http://tuner.classical102.com/listen.pls");                                    // pls
 //  audio.connecttohost("http://stream.radioparadise.com/flac");                                        // flac
-//  audio.connecttohost("http://stream.sing-sing-bis.org:8000/singsingFlac");                           // flac (ogg)
+//  audio.connecttohost("http://stream.sing-sing-bis.org:1234/singsingFlac");                           // flac (ogg)
 //  audio.connecttohost("http://s1.knixx.fm:5347/dein_webradio_vbr.opus");                              // opus (ogg)
 //  audio.connecttohost("http://stream2.dancewave.online:8080/dance.ogg");                              // vorbis (ogg)
 //  audio.connecttohost("http://26373.live.streamtheworld.com:3690/XHQQ_FMAAC/HLSTS/playlist.m3u8");    // HLS

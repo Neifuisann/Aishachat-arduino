@@ -7,7 +7,7 @@
 static const char *ssid = "HUYBAO";          // your network SSID (name of wifi network)
 static const char *password = "hahoahuybao";  // your network password
 
-static const char *url = "https://elato.s3.us-east-1.amazonaws.com/firmware-button.bin";  //state url of your firmware image
+static const char *url = "https://Aisha.s3.us-east-1.amazonaws.com/firmware-button.bin";  //state url of your firmware image
 
 static const char *server_certificate = R"EOF(  
 -----BEGIN CERTIFICATE-----

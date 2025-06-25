@@ -67,7 +67,7 @@ extern const uint32_t SAMPLE_RATE;
 extern const size_t IMAGE_CHUNK_SIZE;
 
 // ---------- Development ------------
-#define DEV_MODE
+//#define DEV_MODE
 
 // ─── HIGH-LEVEL SWITCHES ─────────────────────────────────────────
 #define TTP_GPIO_WAKE            // we have a capacitive key, not a push-button
